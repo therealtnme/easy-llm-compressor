@@ -124,6 +124,11 @@ class Projection:
         w = self.weight
         return w if self.layout == "linear" else w.t()
 
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        """The module's bias tensor, or ``None``."""
+        return getattr(self.module, "bias", None)
+
     def n_parameters(self) -> int:
         n = self.in_features * self.out_features
         if self.has_bias:

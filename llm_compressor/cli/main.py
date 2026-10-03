@@ -14,12 +14,12 @@ app = typer.Typer(
 app.command(
     "inspect",
     help="Load and inspect a model's architecture without modifying it.",
+)(inspect_command)
 
 app.command(
     "compress",
     help="Physically compress a model (neurons, heads, layers) and report it.",
 )(compress_command)
-
 
 
 def main() -> None:
