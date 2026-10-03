@@ -250,7 +250,7 @@ def delete_layers(model: nn.Module, arch: ModelArchitecture, stack_name: str,
                 getattr(mod, "layer_idx"), int
             ):
                 setattr(mod, "layer_idx", new_i)
-    sync_config(arch, stack, new_len=len(keep_blocks))
+    sync_config(arch, stack, new_len=len(keep_blocks), old_len=n)
 
     result = PruneResult()
     result.removed_layers = len(drop)
@@ -261,17 +261,58 @@ def delete_layers(model: nn.Module, arch: ModelArchitecture, stack_name: str,
     return result
 
 
-def sync_config(arch: ModelArchitecture, stack, new_len: int) -> None:
+def sync_config(arch: ModelArchitecture, stack, new_len: int,
+                old_len: Optional[int] = None) -> None:
     """Update config attributes so ``from_pretrained`` builds the right skeleton."""
     from ..model.introspect import _ConfigView
 
+    old_len = int(old_len if old_len is not None else stack.num_blocks)
     cfg = _ConfigView(arch.config)
+    touched = 0
     for key in stack.config_keys:
         cfg.set(key, new_len)
+        touched += 1
     for key in stack.list_config_keys:
         value = cfg.get(key)
         if isinstance(value, (list, tuple)) and len(value) > new_len:
             cfg.set(key, list(value[:new_len]))
+
+    # Robust fallback: any config leaf that still claims the old depth and looks
+    # like a layer count must be updated, otherwise a saved checkpoint rebuilds
+    # the wrong number of blocks (this is what broke reload).
+    layer_ish = ("layer", "depth", "n_layer", "num_hidden", "num_decoder",
+                 "num_encoder", "num_layers")
+    try:
+        leaves = list(cfg.iter_values())
+    except Exception:  # pragma: no cover - defensive
+        leaves = []
+    if not leaves:
+        for name in dir(arch.config):
+            if name.startswith("_"):
+                continue
+            try:
+                value = getattr(arch.config, name)
+            except Exception:
+                continue
+            leaves.append((name, value))
+    for dotted, value in leaves:
+        leaf = dotted.rsplit(".", 1)[-1]
+        if not any(t in leaf for t in layer_ish):
+            continue
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value == old_len and value != new_len:
+            cfg.set(dotted, new_len)
+            touched += 1
+        elif isinstance(value, (list, tuple)) and len(value) == old_len \
+                and old_len != new_len:
+            cfg.set(dotted, list(value[:new_len]))
+            touched += 1
+    if touched == 0:
+        raise RuntimeError(
+            f"could not find a config attribute describing the depth of "
+            f"'{stack.name}' ({old_len} -> {new_len}); refusing to save a "
+            "checkpoint whose config disagrees with its module list")
 
 
 # --------------------------------------------------------------------------- #

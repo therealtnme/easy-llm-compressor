@@ -235,6 +235,7 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
     else:
         model, config = model_or_id, model_or_id.config
 
+    config = model.config  # the object that save_pretrained will serialise
     policy = _policy(opts)
     arch = ModelIntrospector(model, opts.model or type(model).__name__, config).analyze()
     arch.protected = identify_protected_components(
