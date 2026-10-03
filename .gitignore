@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+scratch/
+*.safetensors
+*.bin
+*.pt
+.cache/
+hf_cache/
