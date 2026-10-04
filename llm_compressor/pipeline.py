@@ -400,8 +400,8 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
             plans = []
         if plans:
             plan = plans[0]
-        allocation = plan.allocation
-        depth_plan = plan.to_dict()
+            allocation = plan.allocation
+            depth_plan = plan.to_dict()
         depth_plan["algorithm"] = "beam"
         depth_plan["candidates"] = len(plans)
         depth_plan["scoring_method"] = scoring_used
@@ -423,69 +423,139 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
                       "saliency_method": sal_info["method"]}
         execution["notes"].append("layer_mode=none: no layer was deleted or fused")
 
-    # ---- config-expressibility of the chosen widths -------------------- #
-        # A scalar FFN config key can only state one width for the whole model,
-        # so uneven per-layer widths would be unreloadable by plain
-        # transformers. Force an even allocation up front.
-        if checkpoint_mod.uniform_widths_required(model) and allocation.get("keep"):
-            paths = list(allocation["keep"])
-            per = min(remove_target // max(1, len(paths)),
-                      int(min(widths[p] for p in paths) * opts.max_remove_ratio))
-            if per > 0:
-                try:
-                    even = budget_mod.allocate(
-                        {p: widths[p] for p in paths},
-                        {p: scores[p] for p in paths}, per * len(paths),
-                        scope="uniform",
-                        max_remove_ratio=max(opts.max_remove_ratio,
-                                             1.0 - opts.min_keep_ratio),
-                        protected=())
-                except budget_mod.BudgetError:
-                    pass
-                else:
-                    allocation = even
-                    execution["notes"].append(
-                        f"allocation forced to equal widths: this architecture's "
-                        f"config can state only one FFN width, so every surviving "
-                        f"FFN keeps {per} removals per layer "
-                        f"({even.get('removed')} total, requested "
-                        f"{remove_target}); uneven widths would be unloadable by "
-                        f"plain transformers")
-                    depth_plan["neuron_cost"] = even.get("mass", 0.0)
-    # ---- structural neuron pruning (physical slice) ------------------------ #
+    # ---- layer deletion FIRST: deleted layers pay into the neuron budget ---- #
+    # A deleted layer takes its whole FFN with it, so those neurons count against
+    # --remove-percent exactly like sliced ones; only the shortfall is then taken
+    # as individual neuron deletion on the partially compressed model. Deletion is
+    # attempted physically here, *before* any tensor is sliced, so a refusal
+    # leaves a consistent (unmodified) model behind.
     teacher_copy = None
     if depth_plan.get("regions") and any(
             r["operation"] == "DISTILL_FUSE" for r in depth_plan["regions"]) \
             and opts.fuse == "learned":
         teacher_copy = copy.deepcopy(model).eval()
 
+    def _remap_layer_names(mapping_ns, mapping):
+        out = {}
+        for name, value in mapping_ns.items():
+            parts = name.split(".")
+            for i, part in enumerate(parts):
+                if part.isdigit() and int(part) in mapping:
+                    parts[i] = str(mapping[int(part)])
+                    break
+            out[".".join(parts)] = value
+        return out
+
+    doomed: set = set()
+    dropped_layers = 0
+    removed_by_layers = 0
+    survivors = depth_plan.get("survivors")
     keep = {p: idx for p, idx in allocation.get("keep", {}).items()}
-    doomed = set()
-    if depth_plan.get("survivors") is not None and depth_plan.get("regions"):
-        survivors = set(depth_plan.get("survivors", []))
-        layer_of = {L.mlp.name: (L.stack, L.index) for L in arch.layers
-                    if L.mlp is not None}
-        for path in list(keep):
-            stack_i = layer_of.get(path)
-            if stack_i and stack_i[0] == stack.name and stack_i[1] not in survivors:
-                doomed.add(path)
-        for path in doomed:
-            keep.pop(path)
-        if doomed:
-            execution["notes"].append(
-                f"{len(doomed)} FFN(s) belong to layers removed by the depth plan; "
-                "their neurons are counted in the global budget arithmetic but are "
-                "removed by layer deletion rather than by slicing")
+    if depth_plan.get("regions") and survivors is not None:
+        survivors = set(survivors)
+        drop = sorted(set(range(teacher_depth)) - survivors)
+        if drop:
+            layer_of = {L.mlp.name: (L.stack, L.index) for L in arch.layers
+                        if L.mlp is not None}
+            doomed_now = {p for p, si in layer_of.items()
+                          if si[0] == stack.name and si[1] not in survivors}
+            removed_by_layers = sum(int(widths.get(p, 0)) for p in doomed_now)
+            if progress:
+                progress(f"deleting {len(drop)} layer(s)")
+            try:
+                pruning.delete_layers(model, arch, stack.name, drop)
+            except pruning.RewriteError as exc:
+                unsupported.append("layer deletion: " + str(exc))
+                execution["notes"].append(
+                    "layer deletion is UNSUPPORTED for this architecture, so no "
+                    f"layer was deleted and the whole {remove_target}-neuron "
+                    "budget is taken from the full model instead: " + str(exc))
+                keep = {}
+                allocation = _neuron_only_allocation(
+                    widths, scores, remove_target, opts, protected_names,
+                    execution["notes"])
+                keep = {p: idx for p, idx in allocation.get("keep", {}).items()}
+            else:
+                dropped_layers = len(drop)
+                mapping = {old: new for new, old in enumerate(sorted(survivors))}
+                scores = _remap_layer_names(scores, mapping)
+                arch = ModelIntrospector(model, opts.model, config).analyze()
+                arch._model = model
+                remaining = max(0, remove_target - removed_by_layers)
+                keep = {}
+                if remaining:
+                    live_widths = {
+                        L.mlp.name: int(L.mlp.intermediate_size)
+                        for L in arch.layers
+                        if L.mlp is not None and L.mlp.is_prunable()
+                        and L.mlp.name not in protected_names}
+                    if live_widths:
+                        try:
+                            allocation = budget_mod.allocate(
+                                live_widths,
+                                {p: scores[p] for p in live_widths},
+                                remaining, scope=opts.allocation,
+                                max_remove_ratio=opts.max_remove_ratio,
+                                protected=protected_names)
+                        except budget_mod.BudgetError as exc:
+                            raise CompressionError(
+                                "layer deletion removed "
+                                f"{removed_by_layers} of the {remove_target} "
+                                f"neurons requested, but the remaining "
+                                f"{remaining} cannot be removed from the "
+                                f"surviving layers: {exc}") from exc
+                        keep = {p: idx for p, idx in
+                                allocation.get("keep", {}).items()}
+                        execution["notes"].append(
+                            f"layer deletion removed {dropped_layers} layer(s) = "
+                            f"{removed_by_layers} of the {remove_target} neurons "
+                            f"requested; the remaining {remaining} were deleted "
+                            "from the surviving layers")
+                if not remaining:
+                    execution["notes"].append(
+                        f"layer deletion alone removed {removed_by_layers} "
+                        f"neurons, meeting the requested {remove_target}; no "
+                        "neuron was sliced out of the surviving layers")
+
+    # Even removal counts keep the levelling step from having to re-select
+    # neurons: a scalar FFN config key can state only one width model-wide.
+    if (checkpoint_mod.uniform_widths_required(model) and keep
+            and not dropped_layers and allocation.get("keep")):
+        paths = list(allocation["keep"])
+        per = min(remove_target // max(1, len(paths)),
+                  int(min(widths[p] for p in paths) * opts.max_remove_ratio))
+        if per > 0:
+            try:
+                even = budget_mod.allocate(
+                    {p: widths[p] for p in paths},
+                    {p: scores[p] for p in paths}, per * len(paths),
+                    scope="uniform",
+                    max_remove_ratio=max(opts.max_remove_ratio,
+                                         1.0 - opts.min_keep_ratio),
+                    protected=())
+            except budget_mod.BudgetError:
+                pass
+            else:
+                allocation = even
+                keep = {p: idx for p, idx in even.get("keep", {}).items()}
+                execution["notes"].append(
+                    "allocation forced to equal widths: this architecture's "
+                    "config can state only one FFN width, so every surviving "
+                    f"FFN keeps {per} removals per layer "
+                    f"({even.get('removed')} total, requested {remove_target}); "
+                    "uneven widths would be unloadable by plain transformers")
+                depth_plan["neuron_cost"] = even.get("mass", 0.0)
+
     # Leveling must happen before any tensor is sliced, so the kept indices stay
     # valid for the live modules. Never emits a config-inexpressible structure.
     try:
         keep, width_fix = checkpoint_mod.enforce_loadable_structure(
-            model, arch, scores, keep, protected=protected_names,
-            exclude=doomed)
+            model, arch, scores, keep, protected=protected_names, exclude=doomed)
     except RuntimeError as exc:
         raise CompressionError(str(exc)) from exc
     if width_fix.get("adjusted"):
         execution["notes"].append(str(width_fix.get("reason")))
+
 
     probe = benchmark_batch(model, seq_len=8)
     mlp_records = []
@@ -513,25 +583,9 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
         arch = ModelIntrospector(model, opts.model, config).analyze()
         arch._model = model
 
-    # ---- layer deletion / learned fusion ---------------------------------- #
-    dropped_layers = 0
+    # ---- learned fusion of fused regions ---------------------------------- #
     distill_result: dict = {"used": False, "reason": "no DISTILL_FUSE region "
                                                      "in the selected plan"}
-    if depth_plan.get("regions"):
-        drop = sorted({i for i in range(teacher_depth)} -
-                      set(depth_plan.get("survivors", [])))
-        if drop:
-            if progress:
-                progress(f"deleting {len(drop)} layer(s)")
-            try:
-                pruning.delete_layers(model, arch, stack.name, drop)
-            except pruning.RewriteError as exc:
-                unsupported.append(f"layer deletion skipped: {exc}")
-                dropped_layers = 0
-            else:
-                dropped_layers = len(drop)
-            arch = ModelIntrospector(model, opts.model, config).analyze()
-            arch._model = model
 
     fuse_regions = [r for r in depth_plan.get("regions", [])
                     if r["operation"] == "DISTILL_FUSE"]

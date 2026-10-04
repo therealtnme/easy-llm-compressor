@@ -412,7 +412,6 @@ def save_compressed(model, arch, out_dir: str, tokenizer=None,
                     extra: Optional[dict] = None) -> dict:
     from safetensors.torch import save_model
 
-    os.makedirs(out_dir, exist_ok=True)
     config = getattr(model, "config", None)
     if config is None:
         raise RuntimeError("model has no config; cannot save a loadable checkpoint")
@@ -425,11 +424,18 @@ def save_compressed(model, arch, out_dir: str, tokenizer=None,
             "widths: plain transformers from_pretrained(..., "
             "ignore_mismatched_sizes=False) would reject it. That is a bug in "
             "the compression step, not a property of the checkpoint.")
-    config.save_pretrained(out_dir)
-    save_model(model, os.path.join(out_dir, "model.safetensors"),
-               metadata={"format": "pt"})
-    if tokenizer is not None:
-        tokenizer.save_pretrained(out_dir)
+    # Everything that can fail is checked *before* a single byte is written, so a
+    # failed run never leaves a folder behind that plain from_pretrained() cannot
+    # read (in particular never one without a config.json carrying `model_type`).
+    described = (bool(widths_described_by_config(model, arch))
+                 if arch is not None else False)
+    if not described:
+        raise RuntimeError(
+            "refusing to save a checkpoint whose config cannot express its FFN "
+            "widths: plain transformers from_pretrained(..., "
+            "ignore_mismatched_sizes=False) would reject it. That is a bug in "
+            "the compression step, not a property of the checkpoint. Nothing was "
+            "written to disk.")
     manifest = build_manifest(arch, model, extra) if arch is not None else {
         "format": "llm-compressor/v1", "model_class": type(model).__name__,
         "mlp": {}, "attention": {}, **(extra or {})}
@@ -445,21 +451,58 @@ def save_compressed(model, arch, out_dir: str, tokenizer=None,
             "refusing to save an inconsistent checkpoint: the recorded structure "
             f"references modules that do not exist ({missing[0]}). This "
             "architecture's layer records cannot be addressed positionally, so "
-            "structural layer deletion is UNSUPPORTED for it.")
-    manifest["config_describes_structure"] = bool(
-        widths_described_by_config(model, arch)) if arch is not None else False
+            "structural layer deletion is UNSUPPORTED for it. Nothing was written "
+            "to disk.")
+    manifest["config_describes_structure"] = described
     manifest["config_keys_synced"] = list(sync_info.get("updated", []))
-    with open(os.path.join(out_dir, MANIFEST), "w", encoding="utf8") as fh:
-        json.dump(manifest, fh, indent=2)
-    if not manifest["config_describes_structure"]:
-        raise RuntimeError(
-            "internal safety check failed: the saved config does not describe "
-            "the saved tensors, so plain from_pretrained() would reject this "
-            "checkpoint. Refusing to leave it on disk.")
+    before = set(os.listdir(out_dir)) if os.path.isdir(out_dir) else set()
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        config.save_pretrained(out_dir)
+        if not getattr(config, "model_type", None):
+            raise RuntimeError(
+                "refusing to write a config.json without `model_type`: no "
+                "program could identify this architecture")
+        save_model(model, os.path.join(out_dir, "model.safetensors"),
+                   metadata={"format": "pt"})
+        if tokenizer is not None:
+            tokenizer.save_pretrained(out_dir)
+        with open(os.path.join(out_dir, MANIFEST), "w", encoding="utf8") as fh:
+            json.dump(manifest, fh, indent=2)
+    except BaseException:
+        _discard_partial(out_dir, before)
+        raise
     manifest["checkpoint_bytes"] = sum(
         os.path.getsize(os.path.join(out_dir, f))
         for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f)))
     return manifest
+
+
+def _discard_partial(out_dir: str, before=()) -> None:
+    """Remove everything this call wrote, so no unloadable folder is left."""
+    import shutil
+
+    keep = set(before or ())
+    try:
+        names = os.listdir(out_dir)
+    except OSError:
+        return
+    for name in names:
+        if name in keep:
+            continue
+        path = os.path.join(out_dir, name)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError:
+            pass
+    try:
+        if not os.listdir(out_dir):
+            os.rmdir(out_dir)
+    except OSError:
+        pass
 
 
 def load_manifest(out_dir: str) -> dict:
