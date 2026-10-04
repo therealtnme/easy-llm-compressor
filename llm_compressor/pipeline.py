@@ -314,6 +314,18 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
             unsupported.append(
                 "EXACT_FUSE: " + fusion_info["reason"] +
                 " (structural proof unavailable, so no layer was fused)")
+        # Layers whose block owns a parameter no other block provides cannot be
+        # deleted structurally (e.g. T5's first decoder block). Treat them as
+        # protected so the search keeps them instead of proposing a plan whose
+        # deletion would produce an unloadable checkpoint.
+        unsafe_layers = pruning.unsafe_layer_indices(arch, stack)
+        if unsafe_layers:
+            protected_names = set(protected_names) | {
+                f"{stack.name}.{i}" for i in unsafe_layers}
+            unsupported.append(
+                f"layer deletion: indices {sorted(unsafe_layers)} of "
+                f"'{stack.name}' own parameters that no other block provides, "
+                "so they are kept (deleting them would not be reloadable)")
         plans = joint_search(
             arch, stack.name, sal_info, widths, scores, remove_target,
             opts.target_student_layers, beam_width=opts.beam_width,
@@ -412,8 +424,13 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
         if drop:
             if progress:
                 progress(f"deleting {len(drop)} layer(s)")
-            pruning.delete_layers(model, arch, stack.name, drop)
-            dropped_layers = len(drop)
+            try:
+                pruning.delete_layers(model, arch, stack.name, drop)
+            except pruning.RewriteError as exc:
+                unsupported.append(f"layer deletion skipped: {exc}")
+                dropped_layers = 0
+            else:
+                dropped_layers = len(drop)
             arch = ModelIntrospector(model, opts.model, config).analyze()
             arch._model = model
 

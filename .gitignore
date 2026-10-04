@@ -13,3 +13,4 @@ scratch/
 *.pt
 .cache/
 hf_cache/
+.agent_progress.md

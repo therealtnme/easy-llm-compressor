@@ -141,7 +141,7 @@ def distill(student, teacher, batches: Sequence[dict],
                                   F.softmax(tl / T, dim=-1),
                                   reduction="batchmean") * (T * T)
                     total = total + cfg.alpha_kl * kl
-                    parts["kl"] = float(kl)
+                    parts["kl"] = float(kl.detach())
                     applied["kl"] = "applied"
             if "ce" in wanted:
                 if s_logits is None:

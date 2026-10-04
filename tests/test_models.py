@@ -245,3 +245,93 @@ def test_save_and_reload_pruned_checkpoint(tmp_path):
     assert torch.allclose(expected, got, atol=1e-5)
     widths = [m.mlp.up_proj.out_features for m in reloaded.model.layers]
     assert widths == [m.mlp.up_proj.out_features for m in model.model.layers]
+
+
+# ------------------------------------------- T5 encoder/decoder layer coupling
+@pytest.mark.parametrize("stack_role,sibling_role", [("decoder", "encoder"),
+                                                     ("encoder", "decoder")])
+def test_t5_layer_deletion_does_not_resize_sibling_stack(stack_role, sibling_role):
+    """Deleting a layer from one T5 stack must not resize the other one.
+
+    Encoder and decoder depth use different config keys (``num_layers`` vs
+    ``num_decoder_layers``); a generic sync that touches the sibling's key
+    rebuilds a skeleton with the wrong number of blocks and the saved manifest
+    can no longer be filled. Index 1 is used because block 0 is not deletable.
+    """
+    import sys
+    sys.path.insert(0, "tests")
+
+    model = _bt("t5")
+    arch = arch_of(model, "t5")
+    stack = next(s for s in arch.stacks if s.role == stack_role)
+    sibling = next(s for s in arch.stacks if s.role == sibling_role)
+    sibling_depth = len(sibling.blocks())
+
+    res = pruning.delete_layers(model, arch, stack.name, [1])
+    assert res.removed_layers == 1
+    assert len(stack.module) == sibling_depth - 1
+    assert len(sibling.module) == sibling_depth, "sibling stack was resized"
+
+    ids = torch.randint(0, 100, (2, 6))
+    batch = make_batch(model, ids)
+    assert output_tensor(model(**batch, use_cache=False)).shape[0] == 2
+
+    # every stack's config depth must agree with its module list, otherwise a
+    # reload would rebuild the wrong skeleton
+    for s in arch.stacks:
+        for key in s.config_keys:
+            assert getattr(model.config, key.rsplit(".", 1)[-1]) == len(s.module)
+
+
+def test_t5_first_block_is_refused_not_corrupted():
+    """T5 block 0 owns the relative-attention bias shared by the whole stack.
+
+    Deleting it cannot be expressed in the config, so it must be refused up
+    front (UNSUPPORTED) rather than turned into an unloadable checkpoint.
+    """
+    import sys
+    sys.path.insert(0, "tests")
+
+    model = _bt("t5")
+    arch = arch_of(model, "t5")
+    decoder = next(s for s in arch.stacks if s.role == "decoder")
+    assert 0 in pruning.unsafe_layer_indices(arch, decoder)
+    with pytest.raises(pruning.RewriteError, match="no surviving block provides"):
+        pruning.delete_layers(model, arch, decoder.name, [0])
+    # the refusal must not have mutated the model
+    assert len(decoder.module) == len(model.decoder.block)
+    assert 1 not in pruning.unsafe_layer_indices(arch, decoder)
+
+
+def test_t5_layer_deletion_survives_save_and_reload(tmp_path):
+    import sys
+    sys.path.insert(0, "tests")
+
+    model = _bt("t5")
+    arch = arch_of(model, "t5")
+    stack = next(s for s in arch.stacks if s.role == "decoder")
+    pruning.delete_layers(model, arch, stack.name, [1])
+
+    ids = torch.randint(0, 100, (2, 6))
+    batch = make_batch(model, ids)
+    with torch.no_grad():
+        expected = output_tensor(model(**batch, use_cache=False))
+    save_compressed(model, arch, str(tmp_path / "t5out"))
+    reloaded, tokenizer = _reload_model(str(tmp_path / "t5out"))
+    got = output_tensor(reloaded(**batch, use_cache=False))
+    assert got.shape == expected.shape
+    assert torch.allclose(expected, got, atol=1e-5)
+
+
+def test_layer_deletion_refuses_shared_depth_key():
+    """If a depth key is shared between stacks, deletion is refused up front."""
+    import sys
+    sys.path.insert(0, "tests")
+
+    model = _bt("t5")
+    arch = arch_of(model, "t5")
+    decoder = next(s for s in arch.stacks if s.role == "decoder")
+    encoder = next(s for s in arch.stacks if s.role == "encoder")
+    encoder.config_keys = list(decoder.config_keys)   # pretend the key is shared
+    with pytest.raises(pruning.RewriteError, match="not supported"):
+        pruning.delete_layers(model, arch, decoder.name, [1])

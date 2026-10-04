@@ -212,6 +212,36 @@ def _set_attention_attrs(module: nn.Module, heads: int, kv_heads: int,
 # --------------------------------------------------------------------------- #
 # layers
 # --------------------------------------------------------------------------- #
+def _provided(block: nn.Module) -> set[str]:
+    """Parameter/buffer paths a block contributes, relative to itself."""
+    return ({name for name, _ in block.named_parameters()} |
+            {name for name, _ in block.named_buffers()})
+
+
+def unsafe_layer_indices(arch: ModelArchitecture, stack) -> set[int]:
+    """Indices of blocks that must not be deleted.
+
+    Some blocks own a parameter that every other block relies on without holding
+    a reference to it (T5's first decoder block carries the relative-attention
+    bias used by the whole decoder stack). Removing such a block leaves a model
+    whose config can no longer rebuild the surviving structure, so the manifest
+    could not be filled on reload. Detected structurally, not per architecture.
+    """
+    module = getattr(stack, "module", None)
+    if module is None:
+        return set()
+    provided = [_provided(b) for b in module]
+    unsafe: set[int] = set()
+    for i in range(len(provided)):
+        survivors: set[str] = set()
+        for j, p in enumerate(provided):
+            if j != i:
+                survivors |= p
+        if not provided[i] <= survivors:
+            unsafe.add(i)
+    return unsafe
+
+
 def delete_layers(model: nn.Module, arch: ModelArchitecture, stack_name: str,
                   indices: Iterable[int]) -> PruneResult:
     """Remove whole blocks from a layer stack and keep the config consistent."""
@@ -229,16 +259,59 @@ def delete_layers(model: nn.Module, arch: ModelArchitecture, stack_name: str,
     if len(drop) >= n:
         raise RewriteError("refusing to delete every layer of a stack")
 
-    # A layer record without a positional index cannot be renumbered after the
-    # ModuleList shifts, and a stale record produces a manifest that references
-    # modules which no longer exist (an unloadable checkpoint). Refuse instead.
-    unindexed = [L.name for L in arch.layers
-                 if L.stack == stack_name and L.index is None]
-    if unindexed:
+    # A layer record that is not positionally addressable cannot be renumbered
+    # after the ModuleList shifts, and a stale record produces a manifest that
+    # references modules which no longer exist (an unloadable checkpoint).
+    # Verify this *before* mutating anything and refuse instead of guessing.
+    misaddressed = [L.name for L in arch.layers
+                    if L.stack == stack_name
+                    and (L.index is None or L.name != f"{stack_name}.{L.index}")]
+    if misaddressed:
         raise RewriteError(
-            "layer deletion is not supported for this stack: layer records have "
-            f"no positional index (first: {unindexed[0]}); refusing to produce a "
-            "checkpoint whose structure cannot be described unambiguously")
+            "layer deletion is not supported for this stack: layer records are "
+            f"not positionally addressable (first: {misaddressed[0]}); refusing "
+            "to produce a checkpoint whose structure cannot be described "
+            "unambiguously")
+
+    # Detect, before any mutation, a stack whose depth cannot be changed
+    # independently: if one of this stack's depth keys also describes a sibling
+    # stack (e.g. a shared depth attribute), shrinking this stack would silently
+    # resize that sibling, so the config would disagree with the module list and
+    # the reloaded skeleton could not be filled from the manifest.
+    own_keys = set(stack.config_keys) | set(stack.list_config_keys)
+    shared: list[tuple[str, str]] = []
+    for other in arch.stacks:
+        if other.name == stack.name:
+            continue
+        overlap = own_keys & (set(other.config_keys) | set(other.list_config_keys))
+        if overlap:
+            shared.append((other.name, sorted(overlap)[0]))
+    if shared:
+        other_name, key = shared[0]
+        raise RewriteError(
+            f"layer deletion is not supported for stack '{stack_name}': its "
+            f"depth is described by config key '{key}', which also describes "
+            f"stack '{other_name}'; shrinking this stack would change that "
+            "stack's depth, so a saved checkpoint could not be rebuilt")
+
+    # A block may own a parameter that the remaining blocks depend on but do not
+    # hold a reference to. Deleting the owner would leave a structure the config
+    # cannot rebuild, so refuse before mutating anything.
+    kept_preview = [b for i, b in enumerate(stack.module)  # type: ignore[union-attr]
+                    if i not in set(drop)]
+    survived: set[str] = set()
+    for b in kept_preview:
+        survived |= _provided(b)
+    lost: set[str] = set()
+    for i in drop:
+        lost |= _provided(stack.module[i])  # type: ignore[index]
+    missing = sorted(lost - survived)
+    if missing:
+        raise RewriteError(
+            f"layer deletion is not supported for stack '{stack_name}': block(s) "
+            f"{drop} contribute parameter(s) that no surviving block provides "
+            f"(first: {missing[0]}); deleting them would leave a structure the "
+            "config cannot rebuild")
 
     refs: dict[int, int] = {}
     for b in stack.module:  # type: ignore[union-attr]
@@ -262,6 +335,23 @@ def delete_layers(model: nn.Module, arch: ModelArchitecture, stack_name: str,
             ):
                 setattr(mod, "layer_idx", new_i)
     sync_config(arch, stack, new_len=len(keep_blocks), old_len=n)
+
+    # The config must now describe exactly the surviving structure for *every*
+    # stack. If it does not, a reload builds a skeleton with the wrong number of
+    # blocks and the manifest cannot be filled -- refuse rather than write a
+    # checkpoint that cannot be loaded.
+    from ..model.introspect import _ConfigView
+
+    cfg_view = _ConfigView(arch.config)
+    for s2 in arch.stacks:
+        depth = len(s2.module)
+        for key in s2.config_keys:
+            value = cfg_view.get(key)
+            if isinstance(value, int) and value != depth:
+                raise RewriteError(
+                    f"config key '{key}' now describes {value} blocks for stack "
+                    f"'{s2.name}' but that stack has {depth}; refusing to "
+                    "produce a checkpoint whose config disagrees with its modules")
 
     # The architecture snapshot must not keep describing deleted blocks, or a
     # later manifest/report would reference modules that no longer exist. The
@@ -345,6 +435,19 @@ def sync_config(arch: ModelArchitecture, stack, new_len: int,
         if isinstance(value, (list, tuple)) and len(value) > new_len:
             cfg.set(key, list(value[:new_len]))
 
+    # Depth keys that describe a *different* stack must keep their value: deleting
+    # a layer from one stack while a base key silently resizes a sibling rebuilds a
+    # skeleton of the wrong shape, and the saved manifest then references blocks
+    # that no longer exist.
+    owned = set(stack.config_keys) | set(stack.list_config_keys)
+    foreign: dict[str, int] = {}
+    for other in getattr(arch, "stacks", None) or []:
+        if other.name == stack.name:
+            continue
+        for key in list(other.config_keys) + list(other.list_config_keys):
+            if key not in owned:
+                foreign[key] = other.num_blocks
+
     # Robust fallback: any config leaf that still claims the old depth and looks
     # like a layer count must be updated, otherwise a saved checkpoint rebuilds
     # the wrong number of blocks (this is what broke reload).
@@ -369,6 +472,8 @@ def sync_config(arch: ModelArchitecture, stack, new_len: int,
             continue
         if isinstance(value, bool):
             continue
+        if dotted in foreign:
+            continue
         if isinstance(value, int) and value == old_len and value != new_len:
             cfg.set(dotted, new_len)
             touched += 1
@@ -376,6 +481,16 @@ def sync_config(arch: ModelArchitecture, stack, new_len: int,
                 and old_len != new_len:
             cfg.set(dotted, list(value[:new_len]))
             touched += 1
+    drifted = [key for key, depth in foreign.items()
+               if isinstance(cfg.get(key), int) and cfg.get(key) != depth]
+    if drifted:
+        for key in drifted:
+            cfg.set(key, foreign[key])
+        raise RuntimeError(
+            f"refusing to resize '{stack.name}': config key(s) {drifted} "
+            "describe the depth of another stack and would rebuild a skeleton "
+            "of the wrong shape")
+
     if touched == 0:
         raise RuntimeError(
             f"could not find a config attribute describing the depth of "
