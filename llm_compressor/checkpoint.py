@@ -25,19 +25,41 @@ def _proj_path(p) -> Optional[str]:
     return p.name if p is not None else None
 
 
+def _present(model, *paths) -> bool:
+    """True when every given dotted path really exists on the live model."""
+    for path in paths:
+        if not path:
+            continue
+        try:
+            model.get_submodule(path)
+        except AttributeError:
+            return False
+    return True
+
+
 def build_manifest(arch, model, extra: Optional[dict] = None) -> dict:
+    """Describe the *current* structure of ``model``.
+
+    The architecture snapshot is only a hint here: after structural deletion it
+    can still mention blocks that were physically removed, and a manifest that
+    references missing modules makes the checkpoint unloadable. So every entry
+    is checked against the live module graph.
+    """
     mlp = {}
     attn = {}
     for L in arch.layers:
         m = L.mlp
-        if m is not None and m.intermediate_size:
+        if m is not None and m.intermediate_size and _present(
+                model, _proj_path(m.gate_proj), _proj_path(m.up_proj),
+                _proj_path(m.down_proj)):
             mlp[m.name] = {
                 "width": int(m.intermediate_size),
                 "gate": _proj_path(m.gate_proj), "up": _proj_path(m.up_proj),
                 "down": _proj_path(m.down_proj), "fused": bool(m.gate_up_fused),
             }
         for a in (L.attentions or ([L.attention] if L.attention else [])):
-            if not a.num_heads:
+            if not a.num_heads or not _present(
+                    model, _proj_path(a.q_proj), _proj_path(a.o_proj)):
                 continue
             attn[a.name] = {
                 "heads": int(a.num_heads),
@@ -53,7 +75,9 @@ def build_manifest(arch, model, extra: Optional[dict] = None) -> dict:
         "config_class": type(getattr(model, "config", arch.config)).__name__,
         "mlp": mlp,
         "attention": attn,
-        "num_layers": arch.num_layers,
+        "num_layers": sum(1 for L in arch.layers
+                          if L.mlp is not None and L.mlp.name in mlp)
+        if mlp else arch.num_layers,
         "parameters": arch.total_parameters,
     }
     manifest.update(extra or {})

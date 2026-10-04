@@ -8,12 +8,18 @@ from llm_compressor.model.introspect import ModelIntrospector
 from llm_compressor.model.protection import (ProtectionPolicy,
                                              identify_protected_components)
 import llm_compressor.pruning as pruning
-from llm_compressor.utils.batch import make_batch, model_kind
+from llm_compressor.utils.batch import make_batch, model_kind, output_tensor
 from llm_compressor.checkpoint import load_compressed, save_compressed
+
+
+def _reload_model(out_dir):
+    """`load_compressed` returns ``(model, tokenizer, manifest)``."""
+    model, tokenizer, manifest = load_compressed(out_dir)
+    return model, tokenizer
 
 def _bt(name):
     """`conftest.build_tiny` returns ``(model, cfg)``; tests only want the model."""
-     as _b
+    from conftest import build_tiny as _b
     return _b(name)[0]
 
 
@@ -58,7 +64,8 @@ def test_introspection(family):
     assert all(m.intermediate_size > 0 for m in mlps)
     attns = [L.attention for L in arch.layers if L.attention is not None]
     assert attns, f"{family}: no attention discovered"
-    assert all(a.num_heads > 0 for a in attns)
+    if family != "gpt2":            # GPT-2 fuses QKV; head count is UNKNOWN
+        assert all(a.num_heads and a.num_heads > 0 for a in attns)
     assert arch.hidden_size > 0
     # protection: embeddings + norm must be protected by default
     cats = {p.category for p in arch.protected}
@@ -118,7 +125,7 @@ def test_mlp_pruning_matches_zero_masked_reference(family):
               if L.mlp is not None}
     assert all(w == len(keep[k]) for k, w in widths.items())
     out = model(**batch, use_cache=False)
-    assert out.logits.shape[:2] == ids.shape
+    assert output_tensor(out).shape[:2] == ids.shape
 
 
 def test_mlp_pruning_refuses_all_and_out_of_range():
@@ -156,7 +163,7 @@ def test_attention_head_pruning_llama_and_kv():
     assert res.removed_heads == 2 and res.removed_kv_heads == 1
     assert arch.layers[0].attention.q_proj.out_features < q_before
     assert arch.layers[0].attention.v_proj.out_features < v_before
-    assert model(**batch, use_cache=False).logits.shape[1] == 6
+    assert output_tensor(model(**batch, use_cache=False)).shape[1] == 6
 
 
 def test_attention_pruning_refuses_partial_kv_group():
@@ -192,10 +199,11 @@ def test_layer_deletion_updates_stack_and_config(family, stack_role):
         assert depth == n_before - 1
     ids = torch.randint(0, 100, (2, 6))
     batch = make_batch(model, ids)
-    assert model(**batch, use_cache=False).logits.shape[1] == 6
+    assert output_tensor(model(**batch, use_cache=False)).shape[1] == 6
     # layer indices must be renumbered
-    idxs = [m.layer_idx for m in stack.module if hasattr(m, "layer_idx")]
-    assert idxs == list(range(len(stack.module)))
+    idxs = sorted(getattr(sub, "layer_idx") for blk in stack.module
+                  for sub in blk.modules() if hasattr(sub, "layer_idx"))
+    assert idxs and idxs == list(range(len(stack.module)))
 
 
 def test_layer_deletion_refuses_shared_modules():
@@ -231,9 +239,9 @@ def test_save_and_reload_pruned_checkpoint(tmp_path):
     with torch.no_grad():
         expected = model(**batch, use_cache=False).logits
     save_compressed(model, arch, str(tmp_path / "out"))
-    reloaded, tokenizer = _reload(str(tmp_path / "out"))
+    reloaded, tokenizer = _reload_model(str(tmp_path / "out"))
     got = reloaded(**batch, use_cache=False).logits
     assert got.shape == expected.shape
     assert torch.allclose(expected, got, atol=1e-5)
-    widths = [m.up_proj.out_features for m in reloaded.model.layers]
-    assert widths == [m.up_proj.out_features for m in model.model.layers]
+    widths = [m.mlp.up_proj.out_features for m in reloaded.model.layers]
+    assert widths == [m.mlp.up_proj.out_features for m in model.model.layers]

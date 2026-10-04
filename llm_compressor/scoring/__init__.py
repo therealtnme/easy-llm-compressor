@@ -111,14 +111,37 @@ class ActivationCollector:
 
     def __enter__(self) -> "ActivationCollector":
         for key, mod in self.modules.items():
-            self._handles.append(mod.register_forward_hook(self._make_hook(key)))
+            target = self._hook_target(mod)
+            self._handles.append(target.register_forward_hook(self._make_hook(key)))
         return self
+
+    @staticmethod
+    def _hook_target(module: nn.Module) -> nn.Module:
+        """Where the FFN intermediate activation is observable.
+
+        For a gated/standard MLP the intermediate vector is the *input* of the
+        down projection. Hooking the whole block would capture its hidden-state
+        input instead, which is the wrong width.
+        """
+        for attr in ("down_proj", "c_proj", "fc2", "dense_4h_to_h", "wo"):
+            child = getattr(module, attr, None)
+            if child is None:
+                continue
+            inner = getattr(child, "module", child)
+            if isinstance(inner, nn.Module):
+                return inner
+        return module
 
     def _make_hook(self, key: str):
         def hook(module, inputs, output):
+            if not inputs:
+                return
             x = inputs[0].detach().float()
             x = x.reshape(-1, x.shape[-1]).abs().mean(dim=0)
             self._sum[key] = self._sum.get(key, torch.zeros_like(x)) + x
+            # count automatically: forgetting bump() must not look like
+            # "no activations were captured"
+            self._count += 1
         return hook
 
     def __exit__(self, *exc) -> None:

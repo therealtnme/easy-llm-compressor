@@ -252,6 +252,59 @@ def delete_layers(model: nn.Module, arch: ModelArchitecture, stack_name: str,
                 setattr(mod, "layer_idx", new_i)
     sync_config(arch, stack, new_len=len(keep_blocks), old_len=n)
 
+    # The architecture snapshot must not keep describing deleted blocks, or a
+    # later manifest/report would reference modules that no longer exist. The
+    # surviving blocks also shift position inside the ModuleList, so their
+    # recorded dotted paths (layer, MLP and attention projections, norms) have
+    # to be renumbered -- a reloaded skeleton is built from the *new* config and
+    # is matched against the manifest by path.
+    remap = {old_i: new_i for new_i, old_i in
+             enumerate(i for i in range(n) if i not in set(drop))}
+
+    def _set_name(obj, value: str) -> None:
+        params = getattr(type(obj), "__dataclass_params__", None)
+        if params is not None and getattr(params, "frozen", False):
+            object.__setattr__(obj, "name", value)
+        else:
+            obj.name = value
+
+    def _rename(obj, old_pref: str, new_pref: str) -> None:
+        nm = getattr(obj, "name", None)
+        if isinstance(nm, str) and nm.startswith(old_pref):
+            _set_name(obj, new_pref + nm[len(old_pref):])
+
+    def _rename_proj(p, old_pref: str, new_pref: str) -> None:
+        _rename(p, old_pref, new_pref)
+
+    surviving = []
+    for L in arch.layers:
+        if L.stack == stack_name and L.index in drop:
+            continue                      # physically removed: drop the record
+        if L.stack == stack_name and L.index in remap:
+            old_pref = f"{stack_name}.{L.index}"
+            new_pref = f"{stack_name}.{remap[L.index]}"
+            L.index = remap[L.index]
+            _rename(L, old_pref, new_pref)
+            m, a_ = L.mlp, L.attention
+            if m is not None:
+                _rename(m, old_pref, new_pref)
+                for proj in (m.gate_proj, m.up_proj, m.down_proj):
+                    _rename_proj(proj, old_pref, new_pref)
+            if a_ is not None:
+                _rename(a_, old_pref, new_pref)
+                for proj in (a_.q_proj, a_.k_proj, a_.v_proj, a_.o_proj):
+                    _rename_proj(proj, old_pref, new_pref)
+            for extra in list(L.attentions) + list(L.norms):
+                _rename(extra, old_pref, new_pref)
+        surviving.append(L)
+    arch.layers = surviving
+
+    stack.num_blocks = len(keep_blocks)
+    arch.num_layers = sum(len(s2.module) for s2 in arch.stacks)  # type: ignore[arg-type]
+    arch.total_parameters = sum(p.numel() for p in model.parameters())
+    arch.trainable_parameters = sum(p.numel() for p in model.parameters()
+                                    if p.requires_grad)
+
     result = PruneResult()
     result.removed_layers = len(drop)
     for i in drop:

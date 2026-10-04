@@ -150,11 +150,14 @@ def evaluation_loss(model, batches: Sequence[dict]) -> dict:
         labels = probe.get("decoder_input_ids", probe["input_ids"])
         shift_logits = logits[:, :-1].float()
         shift_labels = labels[:, 1:]
+        # teacher/student sequence lengths may differ by a token; score the
+        # common prefix instead of raising a shape error
         n = min(shift_logits.shape[0], shift_labels.shape[0])
-        loss = F.cross_entropy(shift_logits[:n].reshape(
-            -1, shift_logits.shape[-1]), shift_labels[:n].reshape(-1),
+        steps = min(shift_logits.shape[1], shift_labels.shape[1])
+        loss = F.cross_entropy(shift_logits[:n, :steps].reshape(
+            -1, shift_logits.shape[-1]), shift_labels[:n, :steps].reshape(-1),
             ignore_index=-100, reduction="sum")
-        tokens = int((shift_labels[:n] != -100).sum())
+        tokens = int((shift_labels[:n, :steps] != -100).sum())
         if tokens:
             total_loss += float(loss)
             total_tokens += tokens

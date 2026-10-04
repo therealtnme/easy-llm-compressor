@@ -747,16 +747,23 @@ class ModelIntrospector:
 
     # ---------------------------------------------------------------- #
     def _residual_evidence(self, block: nn.Module) -> str:
-        try:
-            src = inspect.getsource(type(block).forward)
-        except Exception:
+        """Look for a residual add in the block's forward or, for blocks that
+        delegate (e.g. BERT's ``*Output`` sub-modules), in descendant forwards."""
+        seen_types = set()
+        for mod in block.modules():
+            t = type(mod)
+            if t in seen_types or t is nn.Sequential or t is nn.ModuleList:
+                continue
+            seen_types.add(t)
             try:
-                src = inspect.getsource(block.forward)  # type: ignore[arg-type]
-            except Exception:
-                return ""
-        for m in RESIDUAL_RE.finditer(src):
-            start = max(0, m.start() - 24)
-            return f"forward source: …{src[start:m.end() + 16].strip()}…"
+                src = inspect.getsource(t.forward)
+            except (OSError, TypeError):
+                continue
+            m = RESIDUAL_RE.search(src)
+            if m:
+                start = max(0, m.start() - 24)
+                where = "block" if mod is block else t.__name__
+                return f"forward source ({where}): {src[start:m.end() + 16].strip()!r}"
         return ""
 
     # ------------------------------------------------------------------ #

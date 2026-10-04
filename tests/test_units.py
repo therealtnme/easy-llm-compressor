@@ -13,7 +13,7 @@ from llm_compressor import fusion as F
 # --------------------------------------------------------------------- algebra
 def _bt(name):
     """`conftest.build_tiny` returns ``(model, cfg)``; tests only want the model."""
-     as _b
+    from conftest import build_tiny as _b
     return _b(name)[0]
 
 
@@ -59,7 +59,8 @@ def test_dimension_mismatch_refused():
 
 def test_conv1d_conv1d_fuses():
     from transformers.pytorch_utils import Conv1D
-    a, b = Conv1D(6, 5), Conv1D(5, 4)
+    # Conv1D(nf, nx): nf = OUTPUT features, nx = INPUT features.
+    a, b = Conv1D(5, 6), Conv1D(4, 5)
     out = F.compose_chain([Projection.of("a", a), Projection.of("b", b)])
     x = torch.randn(2, 6)
     assert torch.allclose(b(a(x)), x @ out["weight"].T + out["bias"], atol=1e-5)
@@ -68,7 +69,7 @@ def test_conv1d_conv1d_fuses():
 
 def test_conv1d_linear_fuses():
     from transformers.pytorch_utils import Conv1D
-    a, b = Conv1D(6, 5), nn.Linear(5, 3)
+    a, b = Conv1D(5, 6), nn.Linear(5, 3)
     out = F.compose_chain([Projection.of("a", a), Projection.of("b", b)])
     assert out["weight"].shape == (3, 6)
 
@@ -100,12 +101,23 @@ def test_sequential_chain_detected_and_fused():
     assert torch.allclose(net(x), before, atol=1e-5)
 
 
+class _AffineNet(nn.Module):
+    """Minimal stand-in for an HF block: accepts **batch and returns an object."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Sequential(nn.Linear(6, 5), nn.Linear(5, 5))
+
+    def forward(self, input_ids=None, **kwargs):
+        return type("Out", (), {"logits": self.proj(input_ids)})()
+
+
 def test_verify_fusion_restores_and_matches():
-    net = nn.Sequential(nn.Linear(6, 5), nn.Linear(5, 5))
+    model = _AffineNet()
     probe = {"input_ids": torch.randn(2, 4, 6)}
-    out = F.verify_fusion(net, net, 0, 2, probe)
+    out = F.verify_fusion(model, model.proj, 0, 2, probe)
     assert out["verified"] and out["max_abs_diff"] < 1e-5
-    assert len(list(net.named_children())) == 2  # restored
+    assert len(list(model.proj.named_children())) == 2  # restored
 
 
 def test_nonlinearity_blocks_fusion():
@@ -190,11 +202,15 @@ def test_weight_scoring_modes_and_allocation():
                                         normalize_scores, resolve_method)
     m = nn.Linear(8, 8)
     m2 = nn.Linear(8, 16)
-    mlp = type("M", (), {})()
+    mlp = nn.Module()
+    mlp.add_module("gate_proj", m)
+    mlp.add_module("up_proj", m)
+    mlp.add_module("down_proj", m2)
     from llm_compressor.model.architecture import MLPInfo
-    info = MLPInfo(gate_proj=Projection.of("g", m), up_proj=Projection.of("u", m),
+    info = MLPInfo("blk.mlp", mlp, gate_proj=Projection.of("g", m),
+                   up_proj=Projection.of("u", m),
                    down_proj=Projection.of("d", m2), intermediate_size=8,
-                   kind="gated", status=None, reason="")
+                   kind="gated")
     for mode in ("l1", "l2", "combined"):
         s = neuron_weight_scores(info, mode)
         assert s.shape == (8,) and torch.isfinite(s).all()
@@ -211,12 +227,12 @@ def test_weight_scoring_modes_and_allocation():
 def test_activation_scoring_needs_real_data(tiny_tokenizer, tmp_path):
     import sys
     sys.path.insert(0, "tests")
-        from llm_compressor.data import prepare
+    from llm_compressor.data import prepare
     from llm_compressor.scoring import (ActivationCollector, activation_scores,
                                         neuron_weight_scores)
     model = _bt("llama")
     text_file = tmp_path / "corpus.txt"
-    text_file.write_text("\n".join(tiny_texts), encoding="utf8")
+    text_file.write_text("\n".join(_TEXTS), encoding="utf8")
     data = prepare(model, tiny_tokenizer, str(text_file), seq_len=8, samples=4,
                    packing=False, cache_dir=str(tmp_path / "cache"))
     arch = __import__("llm_compressor.model.introspect", fromlist=["x"]) \
@@ -258,7 +274,11 @@ def test_search_enforces_target_depth_rule():
         assert len(plan.survivors) == 2
         for region in plan.regions:
             span = region.region_end - region.region_start
-            assert region.student_depth < span, (region.operation, span)
+            if region.operation == "KEEP":
+                assert region.student_depth == span
+            else:
+                # a compressed region must genuinely lose depth
+                assert region.student_depth < span, (region.operation, span)
 
 
 def test_search_rejects_impossible_target_depth():
@@ -282,7 +302,7 @@ def test_search_rejects_impossible_target_depth():
 def test_distillation_improves_student(tiny_tokenizer, tmp_path):
     import sys
     sys.path.insert(0, "tests")
-        from llm_compressor.data import prepare
+    from llm_compressor.data import prepare
     from llm_compressor.distill import DistillConfig, distill
     torch.manual_seed(0)
     teacher = _bt("llama")
@@ -290,7 +310,7 @@ def test_distillation_improves_student(tiny_tokenizer, tmp_path):
     for p in student.parameters():
         p.data.normal_(0, 0.1)
     f = tmp_path / "corpus.txt"
-    f.write_text("\n".join(tiny_texts * 4), encoding="utf8")
+    f.write_text("\n".join(_TEXTS * 4), encoding="utf8")
     data = prepare(student, tiny_tokenizer, str(f), seq_len=16, samples=8,
                    packing=True, cache_dir=str(tmp_path / "c"))
     batches = data.valid
@@ -304,7 +324,7 @@ def test_distillation_improves_student(tiny_tokenizer, tmp_path):
     with torch.no_grad():
         s_logits = student(**batches[0], use_cache=False).logits
     after = float(torch.nn.functional.mse_loss(s_logits, t_logits))
-    assert out["losses"] == ["logit_kl"]
+    assert out["losses"]["kl"] == "applied"
     assert out["steps"] == 25
     assert after < before, (before, after)
 

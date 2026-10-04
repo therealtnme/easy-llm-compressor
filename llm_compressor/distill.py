@@ -38,13 +38,30 @@ class DistillConfig:
         return asdict(self)
 
 
+_LOSS_ALIASES = {
+    "kl": "kl", "logit": "kl", "logits": "kl", "logit_kl": "kl",
+    "soft": "kl", "softmax": "kl",
+    "ce": "ce", "next_token": "ce", "next-token": "ce", "lm": "ce",
+    "cross_entropy": "ce", "cross-entropy": "ce", "hard": "ce",
+    "hidden": "hidden", "hidden_mse": "hidden", "hidden-state": "hidden",
+    "hidden_state_mse": "hidden", "mse": "hidden", "feature": "hidden",
+}
+
+
 def _losses(requested: str) -> list[str]:
-    requested = (requested or "auto").lower()
-    if requested == "auto":
+    requested = (requested or "auto").lower().strip()
+    if requested in ("auto", "all", ""):
         return ["kl", "ce", "hidden"]
-    if requested == "all":
-        return ["kl", "ce", "hidden"]
-    out = [p.strip() for p in requested.split("+") if p.strip()]
+    out = []
+    for part in requested.split("+"):
+        name = _LOSS_ALIASES.get(part.strip())
+        if name is None:
+            raise DistillError(
+                f"unknown distillation loss '{part.strip()}'; expected one of "
+                "kl | logit_kl | ce | next_token | hidden_mse (or 'all')"
+            )
+        if name not in out:
+            out.append(name)
     if not out:
         raise DistillError("no distillation losses requested")
     return out
@@ -133,10 +150,13 @@ def distill(student, teacher, batches: Sequence[dict],
                     ids = batch.get("decoder_input_ids", batch["input_ids"])
                     logits = s_logits[:, :-1].float()
                     labels = causal_labels(ids)[:, 1:]
+                    # teacher/student sequence lengths can differ by one token;
+                    # score the common prefix rather than crashing on a shape error
+                    steps = min(logits.shape[1], labels.shape[1])
                     n = min(logits.shape[0], labels.shape[0])
                     ce = F.cross_entropy(
-                        logits[:n].reshape(-1, logits.shape[-1]),
-                        labels[:n].reshape(-1), ignore_index=-100)
+                        logits[:n, :steps].reshape(-1, logits.shape[-1]),
+                        labels[:n, :steps].reshape(-1), ignore_index=-100)
                     total = total + cfg.alpha_ce * ce
                     parts["ce"] = float(ce)
                     applied["ce"] = "applied"
