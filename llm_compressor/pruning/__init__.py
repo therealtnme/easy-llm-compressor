@@ -229,6 +229,17 @@ def delete_layers(model: nn.Module, arch: ModelArchitecture, stack_name: str,
     if len(drop) >= n:
         raise RewriteError("refusing to delete every layer of a stack")
 
+    # A layer record without a positional index cannot be renumbered after the
+    # ModuleList shifts, and a stale record produces a manifest that references
+    # modules which no longer exist (an unloadable checkpoint). Refuse instead.
+    unindexed = [L.name for L in arch.layers
+                 if L.stack == stack_name and L.index is None]
+    if unindexed:
+        raise RewriteError(
+            "layer deletion is not supported for this stack: layer records have "
+            f"no positional index (first: {unindexed[0]}); refusing to produce a "
+            "checkpoint whose structure cannot be described unambiguously")
+
     refs: dict[int, int] = {}
     for b in stack.module:  # type: ignore[union-attr]
         refs[id(b)] = refs.get(id(b), 0) + 1
@@ -276,11 +287,15 @@ def delete_layers(model: nn.Module, arch: ModelArchitecture, stack_name: str,
     def _rename_proj(p, old_pref: str, new_pref: str) -> None:
         _rename(p, old_pref, new_pref)
 
+    def _in_stack(L) -> bool:
+        nm = getattr(L, "name", None)
+        return isinstance(nm, str) and nm.startswith(stack_name + ".")
+
     surviving = []
     for L in arch.layers:
-        if L.stack == stack_name and L.index in drop:
+        if _in_stack(L) and L.index in drop:
             continue                      # physically removed: drop the record
-        if L.stack == stack_name and L.index in remap:
+        if _in_stack(L) and L.index in remap:
             old_pref = f"{stack_name}.{L.index}"
             new_pref = f"{stack_name}.{remap[L.index]}"
             L.index = remap[L.index]

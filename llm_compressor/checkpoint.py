@@ -100,6 +100,19 @@ def save_compressed(model, arch, out_dir: str, tokenizer=None,
     manifest = build_manifest(arch, model, extra) if arch is not None else {
         "format": "llm-compressor/v1", "model_class": type(model).__name__,
         "mlp": {}, "attention": {}, **(extra or {})}
+    # Fail loudly instead of writing a checkpoint that cannot be reloaded.
+    missing = [path for info in list((manifest.get("mlp") or {}).values()) +
+               list((manifest.get("attention") or {}).values())
+               for path in (info.get("gate"), info.get("up"), info.get("down"),
+                            info.get("q"), info.get("k"), info.get("v"),
+                            info.get("o"))
+               if path and not _present(model, path)]
+    if missing:
+        raise RuntimeError(
+            "refusing to save an inconsistent checkpoint: the recorded structure "
+            f"references modules that do not exist ({missing[0]}). This "
+            "architecture's layer records cannot be addressed positionally, so "
+            "structural layer deletion is UNSUPPORTED for it.")
     with open(os.path.join(out_dir, MANIFEST), "w", encoding="utf8") as fh:
         json.dump(manifest, fh, indent=2)
     manifest["checkpoint_bytes"] = sum(

@@ -195,7 +195,12 @@ def benchmark_batch(model, seq_len: int = 16, batch: int = 1) -> dict:
     This is deliberately not called calibration data: it carries no text
     information and is used purely as an invariant/benchmark probe.
     """
+    from ..utils.batch import make_batch
+
     ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).repeat(batch, 1)
     ids = ids % max(1, int(getattr(model.config, "vocab_size", 128) or 128))
-    return {"input_ids": ids, "attention_mask": torch.ones_like(ids),
-            "provenance": "structural_probe"}
+    # make_batch adds decoder_input_ids for encoder-decoder models, which are
+    # required for a seq2seq forward pass to be well defined
+    out = dict(make_batch(model, ids, pad_id=0))
+    out["provenance"] = "structural_probe"
+    return out
