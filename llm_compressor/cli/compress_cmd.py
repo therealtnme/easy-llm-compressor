@@ -46,13 +46,30 @@ def _wizard(base: CompressionOptions) -> CompressionOptions:
         out.dataset = None
 
     _banner("2) neuron budget (one MLP intermediate channel = one neuron)")
-    if typer.confirm("Set an explicit neuron budget?", default=True):
-        if typer.confirm("Give it as a percentage?", default=True):
+    if typer.confirm("Set an explicit neuron budget or output-size goal?",
+                     default=True):
+        how = typer.prompt("specify as (percent/count/goal-neurons/goal-params)",
+                           default="percent")
+        out.remove_percent = None
+        out.remove_count = None
+        out.goal_neurons = None
+        out.goal_params = None
+        if how == "percent":
             out.remove_percent = typer.prompt("percent of MLP neurons to remove",
                                               type=float, default=30.0)
-        else:
+        elif how == "count":
             out.remove_count = typer.prompt("exact number of neurons to remove",
                                             type=int, default=500000)
+        elif how == "goal-neurons":
+            out.goal_neurons = typer.prompt(
+                "MLP neurons wanted in the OUTPUT model", type=int, default=50000)
+        elif how == "goal-params":
+            out.goal_params = typer.prompt(
+                "parameters wanted in the OUTPUT model", type=int,
+                default=175000000)
+        else:
+            typer.secho(f"unknown budget kind '{how}': leaving the budget unset",
+                        fg=typer.colors.YELLOW)
     out.allocation = typer.prompt("allocation (global/uniform/hybrid)",
                                   default=base.allocation)
     out.scoring = typer.prompt(
@@ -112,6 +129,12 @@ def compress_command(
         None, "--remove-percent", help="remove this %% of all MLP neurons"),
     remove_count: Optional[int] = typer.Option(
         None, "--remove-count", help="remove exactly this many MLP neurons"),
+    goal_neurons: Optional[int] = typer.Option(
+        None, "--goal-neurons",
+        help="aim for this many MLP neurons in the OUTPUT model"),
+    goal_params: Optional[int] = typer.Option(
+        None, "--goal-params",
+        help="aim for this many parameters in the OUTPUT model"),
     allocation: str = typer.Option("global", "--allocation",
                                    help="global | uniform | hybrid"),
     scoring: str = typer.Option("weight_combined", "--scoring",
@@ -145,12 +168,22 @@ def compress_command(
 ) -> None:
     """Structurally compress a model: physically delete neurons, heads and
     layers, fusing or distilling where that is provable/useful."""
+    given = [name for name, value in (("--remove-percent", remove_percent),
+                                      ("--remove-count", remove_count),
+                                      ("--goal-neurons", goal_neurons),
+                                      ("--goal-params", goal_params))
+             if value is not None]
+    if len(given) > 1:
+        typer.secho("error: choose exactly one of " + ", ".join(given),
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
     opts = CompressionOptions(
         model=model, output=output, dataset=dataset or None,
         dataset_mode=dataset_mode, dataset_split=dataset_split,
         dataset_field=dataset_field, num_samples=num_samples, seq_len=seq_len,
         dataset_free=dataset_free, remove_percent=remove_percent,
-        remove_count=remove_count, allocation=allocation, scoring=scoring,
+        remove_count=remove_count, goal_neurons=goal_neurons,
+        goal_params=goal_params, allocation=allocation, scoring=scoring,
         remove_attention_percent=remove_attention_percent,
         layer_mode=layer_mode, target_student_layers=target_student_layers,
         fuse=fuse, distill_steps=distill_steps, distill_lr=distill_lr,
@@ -182,6 +215,13 @@ def compress_command(
     typer.echo(f"mlp neurons     {init.get('mlp_neuron_count'):,} -> "
                f"{struct.get('mlp_neurons'):,}")
     typer.echo(f"layers          {init.get('layers')} -> {struct.get('layers')}")
+    goal = report.get("goal") or {}
+    if goal.get("kind"):
+        noun = "neurons" if goal["kind"] == "neurons" else "parameters"
+        verdict = "at or under goal" if goal.get("within_goal") else "above goal"
+        typer.echo(f"goal            {noun} {int(goal.get('goal', 0)):,} -> "
+                   f"{int(goal.get('achieved', 0)):,} ({verdict}, "
+                   f"{goal.get('relative_delta', 0.0) * 100:+.2f}%)")
     typer.echo(f"checkpoint      {report.get('output_dir')}")
     typer.echo(f"report          {report['report_files']['json']}")
     typer.echo(f"report          {report['report_files']['text']}")

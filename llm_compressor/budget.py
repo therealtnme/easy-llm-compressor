@@ -49,6 +49,32 @@ def resolve_target(total: int, percent: Optional[float] = None,
     return removed
 
 
+def resolve_goal(total: int, goal: int, min_keep_ratio: float = 0.05,
+                 unit: str = "units") -> int:
+    """Units to remove so the OUTPUT model holds exactly --goal-units.
+
+    Goals are absolute counts for the output. A goal larger than the source is
+    refused (compression cannot grow a model) and the min_keep_ratio guard still
+    applies, so a goal is only accepted when it is actually reachable.
+    """
+    if total <= 0:
+        raise BudgetError("no removable units found")
+    goal = int(goal)
+    if goal <= 0:
+        raise BudgetError(f"{unit} goal must be a positive count")
+    if goal > total:
+        raise BudgetError(
+            f"{unit} goal {goal} exceeds the {total} held by the source model; "
+            "compression cannot add capacity (the model is already smaller than "
+            "the goal)")
+    floor = int(total * float(min_keep_ratio))
+    if goal < floor:
+        raise BudgetError(
+            f"{unit} goal {goal} would keep fewer than the minimum {floor} units "
+            f"({min_keep_ratio:.0%})")
+    return total - goal
+
+
 @dataclass
 class LayerSpec:
     path: str

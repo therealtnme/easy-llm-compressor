@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
@@ -55,6 +56,8 @@ class CompressionOptions:
     # neuron budget
     remove_percent: Optional[float] = None
     remove_count: Optional[int] = None
+    goal_neurons: Optional[int] = None   # absolute MLP-neuron count of OUTPUT
+    goal_params: Optional[int] = None    # absolute parameter count of OUTPUT
     remove_scope: str = "mlp"            # mlp | mlp+attention
     allocation: str = "global"           # global | uniform | hybrid
     scoring: str = "weight_combined"     # weight_* | activation | activation_weighted
@@ -88,6 +91,12 @@ class CompressionOptions:
 
     validate: bool = True
     report_name: str = "compression_report"
+
+    def budget_requested(self) -> bool:
+        """True when the user asked for any neuron budget or output-size goal."""
+        return any(v is not None for v in (
+            self.remove_percent, self.remove_count,
+            self.goal_neurons, self.goal_params))
 
 
 def _policy(opts: CompressionOptions) -> ProtectionPolicy:
@@ -255,6 +264,37 @@ def _neuron_only_allocation(widths, scores, remove_target, opts, protected, note
         return alloc
 
 
+def _params_per_neuron(arch, widths, protected_names) -> dict:
+    """Marginal parameter cost of one MLP intermediate channel, per FFN.
+
+    Derived from the real module (module params / width): removing one channel
+    drops one row of each up-projection and one column of the down-projection,
+    which is exactly that amount for standard and gated FFNs.
+    """
+    out: dict = {}
+    for L in arch.layers:
+        m = L.mlp
+        if m is None or not m.is_prunable() or m.name not in widths:
+            continue
+        if m.name in protected_names:
+            continue
+        width = int(widths[m.name])
+        if width <= 0:
+            continue
+        total = sum(int(p.numel()) for p in m.module.parameters())
+        out[m.name] = max(1, int(round(total / width)))
+    return out
+
+
+def _mean_params_per_neuron(ppn, widths) -> int:
+    """Width-weighted mean cost of one neuron across the removable FFNs."""
+    total = sum(int(ppn[p]) * int(widths[p]) for p in ppn if p in widths)
+    units = sum(int(widths[p]) for p in ppn if p in widths)
+    if units <= 0 or total <= 0:
+        return 0
+    return max(1, int(round(total / units)))
+
+
 def run_compression(model_or_id: Any, opts: CompressionOptions,
                     progress=None) -> dict:
     """Run the full pipeline and return the report dict (also written to disk)."""
@@ -318,10 +358,59 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
               and L.mlp.name not in protected_names}
     total_neurons = sum(widths.values())
     remove_target = 0
-    if opts.remove_percent is not None or opts.remove_count is not None:
-        remove_target = budget_mod.resolve_target(
-            total_neurons, opts.remove_percent, opts.remove_count,
-            min_keep_ratio=opts.min_keep_ratio)
+    ppn = _params_per_neuron(arch, widths, protected_names)
+    mean_ppn = _mean_params_per_neuron(ppn, widths)
+    goal_info: dict = {"kind": None}
+    if opts.budget_requested():
+        given = [name for name, value in (
+            ("--remove-percent", opts.remove_percent),
+            ("--remove-count", opts.remove_count),
+            ("--goal-neurons", opts.goal_neurons),
+            ("--goal-params", opts.goal_params)) if value is not None]
+        if len(given) > 1:
+            raise CompressionError(
+                "choose exactly one neuron budget: " + ", ".join(given) +
+                " cannot be combined")
+        if opts.goal_neurons is not None:
+            goal = int(opts.goal_neurons)
+            remove_target = budget_mod.resolve_goal(
+                total_neurons, goal, min_keep_ratio=opts.min_keep_ratio,
+                unit="neuron(s)")
+            goal_info = {"kind": "neurons", "goal": goal,
+                         "pool_neurons": total_neurons}
+            execution["notes"].append(
+                f"goal: aim for {goal:,} MLP neurons in the output model (the "
+                f"source holds {total_neurons:,}); removing {remove_target:,} - "
+                "as close to the goal as the structure allows without going over")
+        elif opts.goal_params is not None:
+            goal = int(opts.goal_params)
+            if mean_ppn <= 0:
+                raise CompressionError(
+                    "cannot aim for a parameter goal: no prunable FFN was found, "
+                    "so no removal reduces the parameter count")
+            deficit = model_parameters_before - goal
+            if deficit <= 0:
+                raise CompressionError(
+                    f"parameter goal {goal:,} is not smaller than the source "
+                    f"model's {model_parameters_before:,} parameters; compression "
+                    "cannot grow a model (refusing to go over the goal)")
+            approx = int(math.ceil(deficit / mean_ppn))
+            remove_target = budget_mod.resolve_goal(
+                total_neurons, max(1, total_neurons - approx),
+                min_keep_ratio=opts.min_keep_ratio, unit="neuron(s)")
+            goal_info = {"kind": "params", "goal": goal,
+                         "params_before": model_parameters_before,
+                         "params_per_neuron_estimate": mean_ppn,
+                         "approx_neurons_removed": approx}
+            execution["notes"].append(
+                f"goal: aim for {goal:,} parameters in the output model (the "
+                f"source has {model_parameters_before:,}); about {approx:,} of the "
+                f"{total_neurons:,} MLP neurons, rounded so the result stays at or "
+                "under the goal")
+        else:
+            remove_target = budget_mod.resolve_target(
+                total_neurons, opts.remove_percent, opts.remove_count,
+                min_keep_ratio=opts.min_keep_ratio)
 
     # ---- depth / width search --------------------------------------------- #
     stack = _target_stack(arch, opts)
@@ -410,7 +499,7 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
         depth_plan["target_student_layers"] = opts.target_student_layers
         depth_plan["beam_width"] = opts.beam_width
     else:
-        if opts.remove_percent is not None or opts.remove_count is not None:
+        if opts.budget_requested():
             allocation = budget_mod.allocate(
                 widths, scores, remove_target, scope=opts.allocation,
                 max_remove_ratio=opts.max_remove_ratio,
@@ -449,6 +538,7 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
     doomed: set = set()
     dropped_layers = 0
     removed_by_layers = 0
+    removed_layer_params = 0
     survivors = depth_plan.get("survivors")
     keep = {p: idx for p, idx in allocation.get("keep", {}).items()}
     if depth_plan.get("regions") and survivors is not None:
@@ -460,6 +550,9 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
             doomed_now = {p for p, si in layer_of.items()
                           if si[0] == stack.name and si[1] not in survivors}
             removed_by_layers = sum(int(widths.get(p, 0)) for p in doomed_now)
+            removed_layer_params = sum(
+                sum(int(q.numel()) for q in stack.blocks()[i].parameters())
+                for i in drop if i < len(stack.blocks()))
             if progress:
                 progress(f"deleting {len(drop)} layer(s)")
             try:
@@ -648,6 +741,7 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
                               "removed": allocation.get("removed", 0),
                               "scope": opts.allocation,
                               "unit": "mlp_intermediate_channel"},
+            "goal": goal_info,
             "layers": {"teacher_depth": teacher_depth,
                        "target_student_layers": opts.target_student_layers,
                        "student_depth": arch.num_layers,
@@ -687,6 +781,37 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
         raise CompressionError(
             "structural validation failed; refusing to report success: "
             + "; ".join(structural["problems"]))
+
+    # ---- goal accounting: keep the output at/under the requested count ---- #
+    if goal_info.get("kind"):
+        kind = goal_info["kind"]
+        achieved_value = int(structural.get("mlp_neurons", 0) if kind == "neurons"
+                             else structural.get("parameters", 0))
+        goal_value = int(goal_info["goal"])
+        delta = achieved_value - goal_value
+        goal_info.update({
+            "achieved": achieved_value,
+            "delta": delta,
+            "relative_delta": (delta / goal_value) if goal_value else 0.0,
+            "within_goal": bool(delta <= 0),
+            "target_removed": remove_target,
+            "actual_removed": int(allocation.get("removed", 0)),
+        })
+        unit = "MLP neurons" if kind == "neurons" else "parameters"
+        if delta > 0:
+            execution["notes"].append(
+                f"goal not fully met: the output holds {achieved_value:,} {unit}, "
+                f"{delta:,} above the {goal_value:,} goal; the achievable structure "
+                "was coarser than the goal (rounding / width levelling / removal "
+                "caps stopped the deletion short)")
+        elif abs(delta) > max(1, int(0.05 * goal_value)):
+            execution["notes"].append(
+                f"goal met but undershot: the output holds {achieved_value:,} "
+                f"{unit}, {abs(delta):,} below the {goal_value:,} goal")
+        else:
+            execution["notes"].append(
+                f"goal met: the output holds {achieved_value:,} {unit} against a "
+                f"goal of {goal_value:,} ({delta:+,})")
 
     # ---- validation ------------------------------------------------------- #
     validation: dict = {"reload": {"ok": reload_ok, "reason": reload_reason}}
@@ -737,6 +862,7 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
         distillation=distill_result,
         extra={"output_dir": opts.output,
                "checkpoint_manifest": manifest,
+               "goal": goal_info,
                "report_files": {}})
     files = write_report(report, opts.output)
     report["report_files"] = files
