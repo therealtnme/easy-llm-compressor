@@ -84,6 +84,91 @@ def build_manifest(arch, model, extra: Optional[dict] = None) -> dict:
     return manifest
 
 
+# --------------------------------------------------------------------------- #
+# config synchronisation: make the saved config describe the saved tensors
+# --------------------------------------------------------------------------- #
+_WIDTH_KEYS = ("intermediate_size", "n_inner", "ffn_dim", "ff_dim",
+               "dense_ffn_dim", "ffn_hidden_size", "mlp_dim", "d_ff")
+
+
+def _layer_index(name: str):
+    """Last integer segment of a dotted path -> the layer index it belongs to."""
+    idx = None
+    for part in name.split("."):
+        if part.isdigit():
+            idx = int(part)
+    return idx
+
+
+def live_mlp_widths(model, arch) -> dict:
+    """Measured intermediate width of every FFN, read from the live tensors."""
+    widths = {}
+    for L in arch.layers:
+        m = getattr(L, "mlp", None)
+        if m is None:
+            continue
+        for proj, axis in ((m.up_proj, "out"), (m.gate_proj, "out"),
+                           (m.down_proj, "in")):
+            if proj is None or not proj.name:
+                continue
+            try:
+                mod = model.get_submodule(proj.name)
+            except AttributeError:
+                continue
+            p = Projection.of(proj.name, mod)
+            w = p.out_features if axis == "out" else p.in_features
+            if w:
+                widths[m.name] = int(w)
+                break
+    return widths
+
+
+def sync_config_to_structure(model, arch) -> dict:
+    """Rewrite the model config so it describes the *compressed* FFN widths.
+
+    A checkpoint whose config still advertises the pre-pruning width cannot be
+    reloaded by plain `transformers`, so the config is rebuilt from the live
+    tensor shapes. Uniform widths go into the scalar keys; per-layer widths go
+    into a per-layer list when the config already uses one. When neither can
+    express the result the caller is told, so it can never be silent.
+    """
+    cfg = getattr(model, "config", None)
+    info = {"updated": [], "expressible": True, "widths": {}}
+    if cfg is None or arch is None:
+        return info
+    widths = live_mlp_widths(model, arch)
+    info["widths"] = widths
+    if not widths:
+        return info
+    unique = set(widths.values())
+    ordered = [widths[k] for k in sorted(
+        widths, key=lambda n: (_layer_index(n) if _layer_index(n) is not None
+                               else 0))]
+    n_layers = max(len(arch.layers), len(ordered))
+    for key in _WIDTH_KEYS:
+        if not hasattr(cfg, key):
+            continue
+        current = getattr(cfg, key)
+        if isinstance(current, (list, tuple)):
+            if len(ordered) == len(current):
+                setattr(cfg, key, list(ordered))
+                info["updated"].append(key)
+            elif len(unique) == 1 and len(current) >= n_layers:
+                setattr(cfg, key, [ordered[0]] * len(current))
+                info["updated"].append(key)
+            elif any(isinstance(v, (list, tuple)) for v in current) is False:
+                info["expressible"] = False
+            continue
+        if not isinstance(current, int):
+            continue
+        if len(unique) == 1:
+            setattr(cfg, key, ordered[0])
+            info["updated"].append(key)
+        else:
+            info["expressible"] = False
+    return info
+
+
 def save_compressed(model, arch, out_dir: str, tokenizer=None,
                     extra: Optional[dict] = None) -> dict:
     from safetensors.torch import save_model
@@ -92,6 +177,7 @@ def save_compressed(model, arch, out_dir: str, tokenizer=None,
     config = getattr(model, "config", None)
     if config is None:
         raise RuntimeError("model has no config; cannot save a loadable checkpoint")
+    sync_info = sync_config_to_structure(model, arch)
     config.save_pretrained(out_dir)
     save_model(model, os.path.join(out_dir, "model.safetensors"),
                metadata={"format": "pt"})
@@ -113,8 +199,16 @@ def save_compressed(model, arch, out_dir: str, tokenizer=None,
             f"references modules that do not exist ({missing[0]}). This "
             "architecture's layer records cannot be addressed positionally, so "
             "structural layer deletion is UNSUPPORTED for it.")
+    manifest["config_describes_structure"] = bool(sync_info.get("expressible", True))
+    manifest["config_keys_synced"] = list(sync_info.get("updated", []))
     with open(os.path.join(out_dir, MANIFEST), "w", encoding="utf8") as fh:
         json.dump(manifest, fh, indent=2)
+    if not manifest["config_describes_structure"]:
+        print(
+            "warning: this checkpoint has per-layer widths that its config cannot "
+            "express. Load it with llm_compressor.checkpoint.load_compressed() or "
+            "llm_compressor.load_model_for_inspection(); plain transformers "
+            "from_pretrained() will reject it rather than silently mismatch.")
     manifest["checkpoint_bytes"] = sum(
         os.path.getsize(os.path.join(out_dir, f))
         for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f)))

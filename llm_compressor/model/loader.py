@@ -40,6 +40,18 @@ def load_model_for_inspection(
     then falls back to AutoModel. Uses dtype= (not torch_dtype=).
     Never modifies the loaded model beyond eval() and optional device move.
     """
+    import os as _os
+
+    # A compressed checkpoint needs its skeleton rebuilt to the recorded shape
+    # before the saved tensors can be filled in. Loading it with plain
+    # from_pretrained() would mismatch the config, so it is handled here.
+    if _os.path.isdir(model_id) and _os.path.exists(
+            _os.path.join(model_id, "compression_manifest.json")):
+        from ..checkpoint import load_compressed
+
+        model, _tok, _man = load_compressed(model_id, device=device)
+        return model, model.config
+
     from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
     dtype = resolve_dtype(dtype_str)

@@ -335,3 +335,62 @@ def test_layer_deletion_refuses_shared_depth_key():
     encoder.config_keys = list(decoder.config_keys)   # pretend the key is shared
     with pytest.raises(pruning.RewriteError, match="not supported"):
         pruning.delete_layers(model, arch, decoder.name, [1])
+
+
+# ------------------------------- recompression of a compressed checkpoint
+def test_compressed_checkpoint_can_be_reloaded_and_recompressed(tmp_path):
+    """A compressed checkpoint must load and compress again (LFM2-style configs
+    whose FFN width the saved config has to be rewritten for)."""
+    import json
+    import subprocess
+    import sys
+
+    import pytest
+
+    transformers = pytest.importorskip("transformers")
+    from conftest import make_tokenizer
+    if not hasattr(transformers, "Lfm2Config"):
+        pytest.skip("transformers has no Lfm2Config")
+
+    cfg = transformers.Lfm2Config(
+        vocab_size=128, hidden_size=32, intermediate_size=64,
+        num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+        max_position_embeddings=64, block_multiple_of=1,
+        block_auto_adjust_ff_dim=False, attn_implementation="eager",
+    )
+    torch.manual_seed(0)
+    model = transformers.Lfm2ForCausalLM(cfg).eval()
+    src = str(tmp_path / "src")
+    model.save_pretrained(src)
+    make_tokenizer().save_pretrained(src)
+
+    def compress(src_dir, out_dir):
+        return subprocess.run(
+            [sys.executable, "-m", "llm_compressor", "compress", src_dir,
+             "--output", out_dir, "--remove-percent", "25",
+             "--allocation", "uniform",
+             "--layer-mode", "none", "--dataset-free",
+             "--no-validate"],
+            capture_output=True, text=True)
+
+    out1 = str(tmp_path / "c1")
+    p1 = compress(src, out1)
+    assert p1.returncode == 0, p1.stderr[-2000:]
+
+    # the saved config must describe the pruned widths, not the original ones
+    saved = json.load(open(out1 + "/config.json", encoding="utf8"))
+    assert saved["intermediate_size"] != cfg.intermediate_size
+
+    # and plain transformers loading must therefore work
+    reloaded = transformers.Lfm2ForCausalLM.from_pretrained(out1)
+    ids = torch.randint(0, 100, (1, 6))
+    with torch.no_grad():
+        res = reloaded(input_ids=ids)
+    assert res.logits.shape[0] == 1
+
+    # compressing the compressed model again must work too
+    out2 = str(tmp_path / "c2")
+    p2 = compress(out1, out2)
+    assert p2.returncode == 0, p2.stderr[-2000:]
+    import os
+    assert os.path.exists(os.path.join(out2, "compression_manifest.json"))
