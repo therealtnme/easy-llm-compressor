@@ -224,6 +224,37 @@ def _apply_attention_pruning(model, arch, opts, batch) -> dict:
             "records": [asdict(r) for r in res.records]}
 
 
+def _neuron_only_allocation(widths, scores, remove_target, opts, protected, notes):
+    """Neuron-only deletion. Falls back to the guard the user actually set
+    (min_keep_ratio) when the default per-layer cap alone would refuse an
+    explicitly requested budget; otherwise it fails with the reason."""
+    try:
+        return budget_mod.allocate(widths, scores, remove_target,
+                                   scope=opts.allocation,
+                                   max_remove_ratio=opts.max_remove_ratio,
+                                   protected=protected)
+    except budget_mod.BudgetError as first:
+        relaxed = max(opts.max_remove_ratio, 1.0 - opts.min_keep_ratio - 1e-9)
+        if relaxed <= opts.max_remove_ratio:
+            raise CompressionError(
+                "cannot satisfy the requested compression: neuron-only deletion "
+                f"failed: {first}") from first
+        try:
+            alloc = budget_mod.allocate(widths, scores, remove_target,
+                                        scope=opts.allocation,
+                                        max_remove_ratio=relaxed,
+                                        protected=protected)
+        except budget_mod.BudgetError as second:
+            raise CompressionError(
+                "cannot satisfy the requested compression: layer deletion was "
+                f"infeasible and neuron-only deletion failed: {second}") from second
+        notes.append(
+            f"per-layer removal cap relaxed from {opts.max_remove_ratio:.2f} to "
+            f"{relaxed:.2f} to honour the explicitly requested budget; the "
+            f"min_keep_ratio guard ({opts.min_keep_ratio:.2f}) still applies")
+        return alloc
+
+
 def run_compression(model_or_id: Any, opts: CompressionOptions,
                     progress=None) -> dict:
     """Run the full pipeline and return the report dict (also written to disk)."""
@@ -326,21 +357,49 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
                 f"layer deletion: indices {sorted(unsafe_layers)} of "
                 f"'{stack.name}' own parameters that no other block provides, "
                 "so they are kept (deleting them would not be reloadable)")
-        plans = joint_search(
-            arch, stack.name, sal_info, widths, scores, remove_target,
-            opts.target_student_layers, beam_width=opts.beam_width,
-            max_span=opts.max_span, max_remove_ratio=opts.max_remove_ratio,
-            protected=protected_names,
-            allow_exact_fuse=allow_exact, allow_distill_fuse=opts.fuse != "none",
-            exact_fuse_reason=fusion_info["reason"],
-            distill_available=data is not None or opts.fuse == "learned",
-            top_k=opts.top_candidates)
+        try:
+            plans = joint_search(
+                arch, stack.name, sal_info, widths, scores, remove_target,
+                opts.target_student_layers, beam_width=opts.beam_width,
+                max_span=opts.max_span, max_remove_ratio=opts.max_remove_ratio,
+                protected=protected_names,
+                allow_exact_fuse=allow_exact,
+                allow_distill_fuse=opts.fuse != "none",
+                exact_fuse_reason=fusion_info["reason"],
+                distill_available=data is not None or opts.fuse == "learned",
+                top_k=opts.top_candidates)
+            search_error = None
+        except Exception as exc:  # reported through the fallback below
+            plans, search_error = [], f"{type(exc).__name__}: {exc}"
+
         if not plans:
-            raise CompressionError(
-                "no valid depth/width plan satisfies the requested target "
-                f"student depth {opts.target_student_layers} with a neuron "
-                f"budget of {remove_target} removals")
-        plan = plans[0]
+            # Layer deletion is an *option*, not a requirement: fall back to
+            # neuron-only deletion and only fail when that cannot work either.
+            reason = ("layer deletion produced no valid depth/width plan for "
+                      f"target student depth {opts.target_student_layers} with "
+                      f"a neuron budget of {remove_target} removals"
+                      + (f" ({search_error})" if search_error else ""))
+            execution["unsupported"].append("layer deletion: " + reason)
+            execution["notes"].append(
+                "layer deletion infeasible, falling back to neuron-only "
+                "deletion: " + reason)
+            allocation = _neuron_only_allocation(
+                widths, scores, remove_target, opts, protected_names,
+                execution["notes"])
+            depth_plan = {
+                "algorithm": "neuron-only-fallback", "regions": [],
+                "teacher_depth": teacher_depth,
+                "target_student_layers": teacher_depth,
+                "layer_cost": 0.0,
+                "neuron_cost": allocation.get("mass", 0.0),
+                "total_cost": allocation.get("mass", 0.0),
+                "scoring_method": scoring_used,
+                "saliency_method": sal_info["method"],
+                "note": reason,
+            }
+            plans = []
+        if plans:
+            plan = plans[0]
         allocation = plan.allocation
         depth_plan = plan.to_dict()
         depth_plan["algorithm"] = "beam"
@@ -364,6 +423,35 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
                       "saliency_method": sal_info["method"]}
         execution["notes"].append("layer_mode=none: no layer was deleted or fused")
 
+    # ---- config-expressibility of the chosen widths -------------------- #
+        # A scalar FFN config key can only state one width for the whole model,
+        # so uneven per-layer widths would be unreloadable by plain
+        # transformers. Force an even allocation up front.
+        if checkpoint_mod.uniform_widths_required(model) and allocation.get("keep"):
+            paths = list(allocation["keep"])
+            per = min(remove_target // max(1, len(paths)),
+                      int(min(widths[p] for p in paths) * opts.max_remove_ratio))
+            if per > 0:
+                try:
+                    even = budget_mod.allocate(
+                        {p: widths[p] for p in paths},
+                        {p: scores[p] for p in paths}, per * len(paths),
+                        scope="uniform",
+                        max_remove_ratio=max(opts.max_remove_ratio,
+                                             1.0 - opts.min_keep_ratio),
+                        protected=())
+                except budget_mod.BudgetError:
+                    pass
+                else:
+                    allocation = even
+                    execution["notes"].append(
+                        f"allocation forced to equal widths: this architecture's "
+                        f"config can state only one FFN width, so every surviving "
+                        f"FFN keeps {per} removals per layer "
+                        f"({even.get('removed')} total, requested "
+                        f"{remove_target}); uneven widths would be unloadable by "
+                        f"plain transformers")
+                    depth_plan["neuron_cost"] = even.get("mass", 0.0)
     # ---- structural neuron pruning (physical slice) ------------------------ #
     teacher_copy = None
     if depth_plan.get("regions") and any(
@@ -388,6 +476,17 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
                 f"{len(doomed)} FFN(s) belong to layers removed by the depth plan; "
                 "their neurons are counted in the global budget arithmetic but are "
                 "removed by layer deletion rather than by slicing")
+    # Leveling must happen before any tensor is sliced, so the kept indices stay
+    # valid for the live modules. Never emits a config-inexpressible structure.
+    try:
+        keep, width_fix = checkpoint_mod.enforce_loadable_structure(
+            model, arch, scores, keep, protected=protected_names,
+            exclude=doomed)
+    except RuntimeError as exc:
+        raise CompressionError(str(exc)) from exc
+    if width_fix.get("adjusted"):
+        execution["notes"].append(str(width_fix.get("reason")))
+
     probe = benchmark_batch(model, seq_len=8)
     mlp_records = []
     equivalence = None
@@ -518,8 +617,15 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
         reload_ok = False
         reload_reason = f"forward pass after reload failed: {exc}"
 
+    plain_ok, plain_reason = checkpoint_mod.plain_load_check(opts.output)
+
     structural = eval_mod.structural_validation(
         reloaded, arch, model_parameters_before, manifest.get("checkpoint_bytes"))
+    structural["plain_from_pretrained"] = {"ok": plain_ok,
+                                          "reason": plain_reason}
+    if not plain_ok:
+        structural["problems"].append(plain_reason)
+        structural["structurally_ok"] = False
     if not reload_ok:
         structural["problems"].append(reload_reason)
         structural["structurally_ok"] = False

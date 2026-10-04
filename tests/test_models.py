@@ -394,3 +394,83 @@ def test_compressed_checkpoint_can_be_reloaded_and_recompressed(tmp_path):
     assert p2.returncode == 0, p2.stderr[-2000:]
     import os
     assert os.path.exists(os.path.join(out2, "compression_manifest.json"))
+
+
+def _tiny_lfm2_config():
+    from transformers import Lfm2Config
+    return Lfm2Config(vocab_size=128, hidden_size=32, intermediate_size=64,
+                      num_hidden_layers=4, num_attention_heads=4,
+                      num_key_value_heads=2, block_multiple_of=1,
+                      block_auto_adjust_ff_dim=False,
+                      attn_implementation="eager")
+
+
+def test_uneven_allocation_is_levelled_to_config_expressible_widths(tmp_path):
+    """Global allocation on a scalar-FFN-key architecture must still produce a
+    checkpoint plain transformers loads with ignore_mismatched_sizes=False."""
+    import json
+    from transformers import Lfm2ForCausalLM
+    from llm_compressor.pipeline import CompressionOptions, run_compression
+
+    model = Lfm2ForCausalLM(_tiny_lfm2_config())
+    out = tmp_path / "tiny-lfm2"
+    opts = CompressionOptions(model="tiny-lfm2", output=str(out), device="cpu",
+                              layer_mode="none", dataset_free=True, fuse="none",
+                              remove_percent=25.0, allocation="global",
+                              validate=False)
+    run_compression(model, opts)
+    reloaded = Lfm2ForCausalLM.from_pretrained(
+        str(out), ignore_mismatched_sizes=False)
+    widths = {m.out_features for n, m in reloaded.named_modules()
+              if n.endswith("feed_forward.w1")}
+    assert widths and len(widths) == 1 and widths != {64}
+    assert reloaded.config.intermediate_size == widths.pop()
+    man = json.loads((out / "compression_manifest.json").read_text(encoding="utf8"))
+    assert man["config_describes_structure"] is True
+
+
+def test_neuron_only_fallback_relaxes_cap_then_fails_with_reason():
+    import pytest
+    import torch
+    from llm_compressor.pipeline import (CompressionError, CompressionOptions,
+                                         _neuron_only_allocation)
+
+    widths = {"m.0": 100, "m.1": 100}
+    scores = {k: torch.ones(v) for k, v in widths.items()}
+    opts = CompressionOptions(min_keep_ratio=0.05, max_remove_ratio=0.9)
+    notes = []
+    alloc = _neuron_only_allocation(widths, scores, 185, opts, (), notes)
+    assert alloc["removed"] == 185
+    assert notes and "relaxed" in notes[0]
+    with pytest.raises(CompressionError):
+        _neuron_only_allocation(widths, scores, 199, opts, ("m.0", "m.1"), notes)
+
+
+def test_config_key_that_differs_from_width_is_inverted(tmp_path):
+    """LFM2 derives the FFN width from intermediate_size (block_auto_adjust_ff_dim),
+    so the saved config must hold the *input* value, not the width, or plain
+    from_pretrained would rebuild the wrong shape."""
+    import json
+    from transformers import Lfm2Config, Lfm2ForCausalLM
+    from llm_compressor.pipeline import CompressionOptions, run_compression
+
+    cfg = Lfm2Config(vocab_size=256, hidden_size=64, intermediate_size=96,
+                     num_hidden_layers=4, num_attention_heads=4,
+                     num_key_value_heads=2, block_auto_adjust_ff_dim=True,
+                     block_ffn_dim_multiplier=0.67, block_multiple_of=1,
+                     attn_implementation="eager")
+    model = Lfm2ForCausalLM(cfg)
+    assert model.model.layers[0].feed_forward.w1.out_features == 42
+    out = tmp_path / "lfm2-derived"
+    opts = CompressionOptions(model="derived", output=str(out), device="cpu",
+                              layer_mode="none", dataset_free=True, fuse="none",
+                              remove_percent=25.0, allocation="global",
+                              validate=False)
+    run_compression(model, opts)
+    reloaded = Lfm2ForCausalLM.from_pretrained(
+        str(out), ignore_mismatched_sizes=False)
+    widths = {m.out_features for n, m in reloaded.named_modules()
+              if n.endswith("feed_forward.w1")}
+    assert widths == {32}
+    saved = json.loads((out / "config.json").read_text(encoding="utf8"))
+    assert saved["intermediate_size"] != 32
