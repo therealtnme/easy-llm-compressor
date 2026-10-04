@@ -35,7 +35,15 @@ def _wizard(base: CompressionOptions) -> CompressionOptions:
                                    default=base.dataset or "")
         out.dataset_mode = typer.prompt("mode (fast/balanced/accurate/custom)",
                                         default=base.dataset_mode)
-        out.dataset_field = typer.prompt("text field", default=base.dataset_field)
+        layout = typer.prompt(
+            "dataset layout (auto, a column name, or a template using "
+            "{column} names)", default=base.dataset_format or "auto")
+        if layout.strip().lower() in ("", "auto"):
+            out.dataset_field = "auto"
+            out.dataset_format = None
+        else:
+            out.dataset_field = "auto"
+            out.dataset_format = layout.strip()
         if out.dataset_mode == "custom":
             out.num_samples = typer.prompt("number of examples", type=int,
                                            default=base.num_samples or 32)
@@ -118,7 +126,15 @@ def compress_command(
     dataset_mode: str = typer.Option("balanced", "--dataset-mode",
                                      help="fast | balanced | accurate | custom"),
     dataset_split: str = typer.Option("train", "--dataset-split"),
-    dataset_field: str = typer.Option("text", "--dataset-field"),
+    dataset_field: str = typer.Option(
+        "auto", "--dataset-field",
+        help="name of the text column, or 'auto' (default) to detect the "
+             "layout"),
+    dataset_format: Optional[str] = typer.Option(
+        None, "--dataset-format",
+        help="explicit layout: a template such as "
+             "'{instruction}\n{input}\n{output}', a comma separated "
+             "column order, or a single column name"),
     num_samples: Optional[int] = typer.Option(None, "--num-samples"),
     seq_len: Optional[int] = typer.Option(None, "--seq-len"),
     dataset_free: bool = typer.Option(
@@ -180,7 +196,9 @@ def compress_command(
     opts = CompressionOptions(
         model=model, output=output, dataset=dataset or None,
         dataset_mode=dataset_mode, dataset_split=dataset_split,
-        dataset_field=dataset_field, num_samples=num_samples, seq_len=seq_len,
+        dataset_field=dataset_field, dataset_format=dataset_format,
+        interactive_data_prompt=True if interactive else None,
+        num_samples=num_samples, seq_len=seq_len,
         dataset_free=dataset_free, remove_percent=remove_percent,
         remove_count=remove_count, goal_neurons=goal_neurons,
         goal_params=goal_params, allocation=allocation, scoring=scoring,
@@ -222,6 +240,11 @@ def compress_command(
         typer.echo(f"goal            {noun} {int(goal.get('goal', 0)):,} -> "
                    f"{int(goal.get('achieved', 0)):,} ({verdict}, "
                    f"{goal.get('relative_delta', 0.0) * 100:+.2f}%)")
+    ds_info = report.get("dataset_info") or {}
+    if ds_info.get("dataset_format_name"):
+        typer.echo(f"calibration     {ds_info.get('examples')} examples via "
+                   f"{ds_info.get('dataset_format_name')} "
+                   f"({ds_info.get('dataset_format_confidence', '?')})")
     typer.echo(f"checkpoint      {report.get('output_dir')}")
     typer.echo(f"report          {report['report_files']['json']}")
     typer.echo(f"report          {report['report_files']['text']}")

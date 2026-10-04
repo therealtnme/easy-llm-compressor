@@ -45,7 +45,9 @@ class CompressionOptions:
     dataset: Optional[str] = None
     dataset_config: Optional[str] = None
     dataset_split: str = "train"
-    dataset_field: str = "text"
+    dataset_field: str = "auto"           # column name, or "auto" to detect
+    dataset_format: Optional[str] = None  # template / column order override
+    interactive_data_prompt: Optional[bool] = None
     dataset_mode: str = "balanced"       # fast | balanced | accurate | custom
     num_samples: Optional[int] = None
     seq_len: Optional[int] = None
@@ -335,7 +337,11 @@ def run_compression(model_or_id: Any, opts: CompressionOptions,
         data = prepare(model, tokenizer, opts.dataset, mode=opts.dataset_mode,
                        seq_len=opts.seq_len, samples=opts.num_samples,
                        packing=opts.packing, field=opts.dataset_field,
-                       split=opts.dataset_split, batch_size=opts.batch_size)
+                       split=opts.dataset_split, batch_size=opts.batch_size,
+                       dataset_config=opts.dataset_config,
+                       format_spec=opts.dataset_format,
+                       interactive=opts.interactive_data_prompt,
+                       notify=progress)
     elif not opts.dataset and not opts.dataset_free:
         opts.dataset_free = True
 

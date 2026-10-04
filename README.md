@@ -127,9 +127,31 @@ Compresses a model and writes a new checkpoint plus a report.
 | --- | --- |
 | `--dataset` | Dataset mode: a HF dataset id, or a local `.txt`/`.jsonl` file of real text. |
 | `--dataset-mode` | `fast`, `balanced`, `accurate` or `custom` (sample count and sequence length presets). |
-| `--dataset-split`, `--dataset-field` | Which split and which column holds the text. |
+| `--dataset-split` | Which split to read. |
+| `--dataset-field` | Name of the text column, or `auto` (default) to detect it. |
+| `--dataset-format` | Explicit layout when detection is unwanted: a template such as `'{instruction}\n{output}'`, a comma separated column order, or a single column name. |
 | `--num-samples`, `--seq-len` | Explicit example count and token length (used with `--dataset-mode custom`). |
 | `--dataset-free` | Dataset-free mode: only data-free methods; activations are never invented. |
+
+
+**Dataset layouts**
+
+`--dataset` accepts any column layout, not just a single `text` column. The
+layout is auto-detected: instruction/input/output triples, input/output or
+prompt/response pairs (`in`/`out`, `question`/`answer`, `source`/`target`, ...),
+single text columns, and chat transcripts stored in a `messages`,
+`conversation`, `conversations` or `chat` column (OpenAI `role`/`content` and
+ShareGPT `from`/`value` turns, including JSON-encoded strings). Chat transcripts
+are rendered as readable `User: ...` / `Assistant: ...` turns before
+tokenization.
+
+When the columns cannot be recognised, `llm-compress` asks how the dataset is
+formatted (in a terminal) and accepts a template using the column names, a
+comma separated column order, or a single column name. Non-interactive runs
+either use a low-confidence guess and say so, or stop with an error naming the
+columns and the `--dataset-format` option. The resolved layout is recorded in
+the run report.
+
 
 **Neuron budget** (one MLP intermediate channel = one neuron)
 

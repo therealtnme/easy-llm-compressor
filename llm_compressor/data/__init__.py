@@ -4,6 +4,9 @@ DATASET MODE  -> real tokenized examples are needed (activation scoring and
                  distillation). Examples are encoded once, cached on disk keyed
                  by (tokenizer, seq_len, packing, sample count), and replayed in
                  batches. No random tensors are ever substituted for text.
+                 The column layout of a dataset is auto-detected (see
+                 ``llm_compressor.data.formats``); if it cannot be recognised the
+                 user is asked how the dataset is formatted.
 DATASET-FREE  -> no examples exist at all; only genuinely data-free methods may
                  be used (weight-norm scoring, structural analysis). The dataset
                  helpers are never called in that mode.
@@ -15,9 +18,11 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 import torch
+
+from .formats import DatasetFormat, FormatError, resolve_format
 
 MODES = {
     "fast": {"samples": 8, "seq_len": 64, "packing": False},
@@ -48,40 +53,138 @@ class CalibrationData:
         return torch.cat([b["input_ids"] for b in self.train], dim=0)
 
 
-def read_texts(source: str, split: str = "train", field: str = "text",
-               limit: Optional[int] = None,
-               local_files_only: bool = False) -> list[str]:
-    """Read real text from a local file (.txt/.jsonl) or a HF datasets dataset."""
-    if os.path.exists(source):
-        if source.endswith((".txt", ".text")):
-            with open(source, encoding="utf8") as fh:
-                texts = [ln.strip() for ln in fh if ln.strip()]
-        elif source.endswith((".jsonl", ".json")):
-            texts = []
-            with open(source, encoding="utf8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    row = json.loads(line)
-                    texts.append(str(row[field] if isinstance(row, dict) else row))
-        else:
-            raise DataError(
-                f"unsupported local dataset file '{source}' "
-                "(expected .txt or .jsonl)")
+# --------------------------------------------------------------------------- #
+# Reading datasets in any shape
+# --------------------------------------------------------------------------- #
+
+def _render_rows(rows: Iterable[Any], fmt: DatasetFormat,
+                 limit: Optional[int] = None) -> list[str]:
+    from .formats import render_value
+
+    texts: list[str] = []
+    for row in rows:
+        text = fmt.render(row) if isinstance(row, dict) else render_value(row)
+        if text.strip():
+            texts.append(text)
+        if limit and len(texts) >= limit:
+            break
+    return texts
+
+
+def _read_local(source: str, field: str, limit: Optional[int],
+                format_spec: Optional[str], interactive: Optional[bool],
+                notify: Optional[Callable[[str], None]],
+                meta: Optional[dict] = None) -> list[str]:
+    if source.endswith((".txt", ".text")):
+        with open(source, encoding="utf8") as fh:
+            texts = [ln.strip() for ln in fh if ln.strip()]
+        if notify:
+            notify("calibration data: local plain-text file, one example per line")
         return texts[:limit] if limit else texts
+    if not source.endswith((".jsonl", ".json", ".ndjson")):
+        raise DataError(
+            f"unsupported local dataset file '{source}' "
+            "(expected .txt, .jsonl or .json)")
+
+    with open(source, encoding="utf8") as fh:
+        blob = fh.read().strip()
+    rows: list[Any] = []
+    try:
+        parsed = json.loads(blob) if blob else None
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, list):
+        rows = parsed
+    elif isinstance(parsed, dict):
+        nested = next((v for v in parsed.values()
+                       if isinstance(v, list) and v and
+                       isinstance(v[0], (dict, str))), None)
+        rows = list(nested) if nested is not None else [parsed]
+    else:  # jsonl / ndjson: one JSON object per line
+        for line in blob.splitlines():
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    if not rows:
+        raise DataError(f"no examples found in '{source}'")
+    if all(isinstance(r, str) for r in rows):
+        return rows[:limit] if limit else rows
+
+    dicts = [r for r in rows if isinstance(r, dict)]
+    if not dicts:
+        raise DataError(f"no usable examples found in '{source}'")
+    columns = list(dict.fromkeys(k for r in dicts[:5] for k in r))
+    fmt = resolve_format(columns, field=field, format_spec=format_spec,
+                         sample=dicts[0], extra_samples=dicts[1:5],
+                         interactive=interactive, notify=notify)
+    _record_format(meta, fmt)
+    if notify:
+        notify("calibration data: " + fmt.summary())
+    return _render_rows(dicts, fmt, limit)
+
+
+def read_texts(source: str, split: str = "train", field: str = "auto",
+               limit: Optional[int] = None,
+               local_files_only: bool = False,
+               dataset_config: Optional[str] = None,
+               format_spec: Optional[str] = None,
+               interactive: Optional[bool] = None,
+               notify: Optional[Callable[[str], None]] = None,
+               meta: Optional[dict] = None) -> list[str]:
+    """Read real text from a local file (.txt/.jsonl/.json) or a HF dataset.
+
+    ``field`` may be a column name, or ``"auto"`` (default) to detect the
+    layout. ``format_spec`` accepts a template such as
+    ``"{instruction}\\n\\n{input}\\n\\n{output}"``, a comma separated column
+    order, or a single column name. When the layout cannot be detected, the
+    user is asked (interactive terminals) or ``FormatError`` explains what to
+    pass instead.
+    """
+    if os.path.exists(source):
+        return _read_local(source, field, limit, format_spec, interactive,
+                           notify, meta)
 
     try:
         from datasets import load_dataset
     except ImportError as exc:  # pragma: no cover
         raise DataError("the 'datasets' package is required to load "
                         f"'{source}'") from exc
-    ds = load_dataset(source, split=split, trust_remote_code=False)
-    if field not in ds.column_names:
-        raise DataError(
-            f"field '{field}' not in dataset columns {ds.column_names}")
-    texts = [str(t) for t in ds[field]]
-    return texts[:limit] if limit else texts
+    if dataset_config:
+        ds = load_dataset(source, dataset_config, split=split,
+                          trust_remote_code=False)
+    else:
+        ds = load_dataset(source, split=split, trust_remote_code=False)
+
+    preview: list[dict] = []
+    try:
+        n = min(5, len(ds))
+        if n:
+            preview = [dict(r) for r in ds.select(range(n))]
+    except Exception:  # iterable datasets without select()
+        preview = [dict(r) for _, r in zip(range(5), iter(ds))]
+
+    fmt = resolve_format(list(ds.column_names), field=field,
+                         format_spec=format_spec,
+                         sample=preview[0] if preview else None,
+                         extra_samples=preview[1:], interactive=interactive,
+                         notify=notify)
+    _record_format(meta, fmt)
+    if notify:
+        notify("calibration data: " + fmt.summary())
+    if fmt.kind in ("column", "chat"):
+        column = fmt.columns[0]
+        return _render_rows(({column: v} for v in ds[column]), fmt, limit)
+    return _render_rows(ds, fmt, limit)
+
+
+def _record_format(meta: Optional[dict], fmt: DatasetFormat) -> None:
+    """Record how the dataset was interpreted, for the run report."""
+    if meta is None:
+        return
+    meta["dataset_format_name"] = fmt.name
+    meta["dataset_format"] = fmt.summary()
+    meta["dataset_format_confidence"] = fmt.confidence
+    meta["dataset_format_columns"] = list(fmt.columns)
 
 
 def _cache_key(tokenizer, seq_len: int, packing: bool, texts: Sequence[str]) -> str:
@@ -143,18 +246,28 @@ def make_batches(model, sequences: Sequence[Sequence[int]], pad_id: int = 0,
 
 def prepare(model, tokenizer, source: str, *, mode: str = "custom",
             seq_len: Optional[int] = None, samples: Optional[int] = None,
-            packing: Optional[bool] = None, field: str = "text",
+            packing: Optional[bool] = None, field: str = "auto",
             split: str = "train", batch_size: int = 4,
             cache_dir: str = ".cache/calibration",
-            local_files_only: bool = False) -> CalibrationData:
+            local_files_only: bool = False,
+            dataset_config: Optional[str] = None,
+            format_spec: Optional[str] = None,
+            interactive: Optional[bool] = None,
+            notify: Optional[Callable[[str], None]] = None) -> CalibrationData:
     """Encode-once-and-cache calibration data (DATASET MODE only)."""
     preset = MODES.get(mode, {})
     seq_len = int(seq_len or preset.get("seq_len") or 128)
     samples = int(samples or preset.get("samples") or 32)
     packing = bool(preset.get("packing", True)) if packing is None else packing
 
-    texts = read_texts(source, split=split, field=field, limit=samples,
-                       local_files_only=local_files_only)
+    meta: dict = {}
+    try:
+        texts = read_texts(source, split=split, field=field, limit=samples,
+                           local_files_only=local_files_only,
+                           dataset_config=dataset_config, format_spec=format_spec,
+                           interactive=interactive, notify=notify, meta=meta)
+    except FormatError as exc:
+        raise DataError(str(exc)) from exc
     if len(texts) < 2:
         raise DataError(f"need at least 2 examples, got {len(texts)} from '{source}'")
     key = _cache_key(tokenizer, seq_len, packing, texts)
@@ -184,6 +297,7 @@ def prepare(model, tokenizer, source: str, *, mode: str = "custom",
             "valid_sequences": len(valid_seqs),
             "cache": cache_file, "cached": os.path.exists(cache_file),
             "tokens": int(sum(len(s) for s in seqs)),
+            **meta,
         },
     )
     return data
